@@ -2,17 +2,16 @@ from __future__ import annotations
 import torch
 from torch import nn
 import torch.distributed as dist
-from transformers import Qwen3Config
+from transformers import Qwen2Config
 
-from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.layernorm import RMSNorm
-from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from nanovllm.layers.gptq_linear import GPTQColumnParallelLinear, GPTQRowParallelLinear
 
 
-class Qwen3Attention(nn.Module):
+class Qwen2Attention(nn.Module):
 
     def __init__(
         self,
@@ -25,6 +24,7 @@ class Qwen3Attention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: dict | None = None,
+        group_size: int = 128,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -38,19 +38,15 @@ class Qwen3Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
-        self.qkv_bias = qkv_bias
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=qkv_bias,
-        )
-        self.o_proj = RowParallelLinear(
+        self.q_proj = GPTQColumnParallelLinear(hidden_size, self.q_size, bias=qkv_bias, group_size=group_size)
+        self.k_proj = GPTQColumnParallelLinear(hidden_size, self.kv_size, bias=qkv_bias, group_size=group_size)
+        self.v_proj = GPTQColumnParallelLinear(hidden_size, self.kv_size, bias=qkv_bias, group_size=group_size)
+        self.o_proj = GPTQRowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
-            bias=False,
+            bias=qkv_bias,
+            group_size=group_size,
         )
         if isinstance(rope_scaling, dict):
             rope_theta = rope_scaling.get("rope_theta", rope_theta)
@@ -66,80 +62,68 @@ class Qwen3Attention(nn.Module):
             self.scaling,
             self.num_kv_heads,
         )
-        if not self.qkv_bias:
-            self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-            self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = q.view(-1, self.num_heads, self.head_dim)
-        k = k.view(-1, self.num_kv_heads, self.head_dim)
-        v = v.view(-1, self.num_kv_heads, self.head_dim)
-        if not self.qkv_bias:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
+        q = self.q_proj(hidden_states).view(-1, self.num_heads, self.head_dim)
+        k = self.k_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
         q, k = self.rotary_emb(positions, q, k)
         o = self.attn(q, k, v)
         output = self.o_proj(o.flatten(1, -1))
         return output
 
 
-class Qwen3MLP(nn.Module):
+class Qwen2MLP(nn.Module):
 
     def __init__(
         self,
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
+        group_size: int = 128,
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-        )
+        self.gate_proj = GPTQColumnParallelLinear(hidden_size, intermediate_size, bias=True, group_size=group_size)
+        self.up_proj = GPTQColumnParallelLinear(hidden_size, intermediate_size, bias=True, group_size=group_size)
+        self.down_proj = GPTQRowParallelLinear(intermediate_size, hidden_size, bias=True, group_size=group_size)
         assert hidden_act == "silu"
-        self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        gate_up = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        x = gate * torch.nn.functional.silu(up)
         x = self.down_proj(x)
         return x
 
 
-class Qwen3DecoderLayer(nn.Module):
+class Qwen2DecoderLayer(nn.Module):
 
     def __init__(
         self,
-        config: Qwen3Config,
+        config: Qwen2Config,
     ) -> None:
         super().__init__()
-        self.self_attn = Qwen3Attention(
+        self.self_attn = Qwen2Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             max_position=config.max_position_embeddings,
             rms_norm_eps=config.rms_norm_eps,
-            qkv_bias=getattr(config, 'attention_bias', True),
-            head_dim=getattr(config, 'head_dim', None),
-            rope_theta=getattr(config, "rope_theta", 1000000),
+            qkv_bias=getattr(config, "attention_bias", True),
+            head_dim=getattr(config, "head_dim", None),
+            rope_theta=getattr(config, "rope_theta", 10000.0),
             rope_scaling=getattr(config, "rope_scaling", None),
+            group_size=getattr(config, "group_size", 128),
         )
-        self.mlp = Qwen3MLP(
+        self.mlp = Qwen2MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
+            group_size=getattr(config, "group_size", 128),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -150,25 +134,28 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # 标准 pre-LN 残差: h = h + attn; h = h + mlp
         if residual is None:
-            hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(positions, hidden_states)
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
         return hidden_states, residual
 
 
-class Qwen3Model(nn.Module):
+class Qwen2Model(nn.Module):
 
     def __init__(
         self,
-        config: Qwen3Config,
+        config: Qwen2Config,
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([Qwen2DecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -176,32 +163,25 @@ class Qwen3Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
+        hidden_states = self.embed_tokens(input_ids).float()  # 全程 fp32, 避免激活放大溢出
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
-        hidden_states, _ = self.norm(hidden_states, residual)
+            # 释放 dequant 临时权重, 控制峰值显存 (每层一次)
+            torch.cuda.empty_cache()
+        hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
-class Qwen3ForCausalLM(nn.Module):
-    packed_modules_mapping = {
-        "q_proj": ("qkv_proj", "q"),
-        "k_proj": ("qkv_proj", "k"),
-        "v_proj": ("qkv_proj", "v"),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
-    }
+class Qwen2ForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: Qwen3Config
+        config: Qwen2Config
     ) -> None:
         super().__init__()
-        self.model = Qwen3Model(config)
+        self.model = Qwen2Model(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
-        if config.tie_word_embeddings:
-            self.lm_head.weight.data = self.model.embed_tokens.weight.data
 
     def forward(
         self,

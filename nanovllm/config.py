@@ -1,9 +1,11 @@
+from __future__ import annotations
 import os
 from dataclasses import dataclass
+from typing import Optional
 from transformers import AutoConfig
 
 
-@dataclass(slots=True)
+@dataclass
 class Config:
     model: str
     max_num_batched_tokens: int = 16384
@@ -12,7 +14,8 @@ class Config:
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
-    hf_config: AutoConfig | None = None
+    quantization: Optional[str] = None
+    hf_config: Optional[AutoConfig] = None
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
@@ -22,4 +25,9 @@ class Config:
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
+        qcfg = getattr(self.hf_config, "quantization_config", None)
+        if qcfg is not None and qcfg.get("quant_method") == "gptq":
+            assert qcfg.get("bits") == 4, "only 4-bit GPTQ is supported"
+            self.quantization = "gptq"
+        assert self.quantization in (None, "gptq")
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

@@ -1,3 +1,4 @@
+from __future__ import annotations
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -58,9 +59,10 @@ class ParallelLMHead(VocabParallelEmbedding):
         if context.is_prefill:
             last_indices = context.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
-        logits = F.linear(x, self.weight)
+        # fp16 matmul (lm_head 输入经 norm 归一化, std 小); 权重为完整 fp16 占显存大, 不全量转 fp32
+        logits = torch.nn.functional.linear(x.half(), self.weight)
         if self.tp_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
             dist.gather(logits, all_logits, 0)
             logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
-        return logits
+        return logits.to(torch.float16)

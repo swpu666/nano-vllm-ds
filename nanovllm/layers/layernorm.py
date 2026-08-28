@@ -1,3 +1,4 @@
+from __future__ import annotations
 import torch
 from torch import nn
 
@@ -11,32 +12,32 @@ class RMSNorm(nn.Module):
     ) -> None:
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+        # 与输入 dtype 一致, 避免 fp32 权重导致输出提升为 float32
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.get_default_dtype()))
 
-    @torch.compile
+    @torch.inference_mode()
     def rms_forward(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        orig_dtype = x.dtype
+        # 始终 fp32 计算并返回 fp32, 避免激活放大时 fp16 溢出
         x = x.float()
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x.mul_(torch.rsqrt(var + self.eps))
-        x = x.to(orig_dtype).mul_(self.weight)
+        x = x.mul(self.weight.float())
         return x
 
-    @torch.compile
+    @torch.inference_mode()
     def add_rms_forward(
         self,
         x: torch.Tensor,
         residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        orig_dtype = x.dtype
-        x = x.float().add_(residual.float())
-        residual = x.to(orig_dtype)
+        x = x.float().add(residual.float())
+        residual = x.clone()
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x.mul_(torch.rsqrt(var + self.eps))
-        x = x.to(orig_dtype).mul_(self.weight)
+        x = x.mul(self.weight.float())
         return x, residual
 
     def forward(

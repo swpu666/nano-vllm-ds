@@ -1,3 +1,4 @@
+from __future__ import annotations
 import pickle
 import torch
 import torch.distributed as dist
@@ -6,29 +7,52 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
+MODEL_REGISTRY = {
+    "Qwen3ForCausalLM": "nanovllm.models.qwen3:Qwen3ForCausalLM",
+    "Qwen2ForCausalLM": "nanovllm.models.qwen2:Qwen2ForCausalLM",
+}
+
+
+def _import_class(path: str):
+    import importlib
+    module_path, cls_name = path.split(":")
+    module = importlib.import_module(module_path)
+    return getattr(module, cls_name)
+
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(self, config: Config, rank: int,  event: Event | list[Event]):
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
-        self.enforce_eager = config.enforce_eager
+        # GPTQ 动态反量化不兼容 CUDA Graph，强制 eager
+        self.enforce_eager = True if config.quantization == "gptq" else config.enforce_eager
         self.world_size = config.tensor_parallel_size
+        assert self.world_size == 1 or config.quantization is None, "GPTQ 仅支持单卡 (TP=1)"
         self.rank = rank
         self.event = event
+
+        # 把 GPTQ group_size 注入 hf_config，供模型构造时读取
+        if config.quantization == "gptq":
+            qcfg = hf_config.quantization_config
+            hf_config.group_size = qcfg.get("group_size", 128)
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.dtype)
+        torch_dtype = hf_config.torch_dtype
+        if isinstance(torch_dtype, str):
+            torch_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[torch_dtype]
+        torch.set_default_dtype(torch_dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        arch = hf_config.architectures[0]
+        model_cls = _import_class(MODEL_REGISTRY.get(arch, MODEL_REGISTRY["Qwen3ForCausalLM"]))
+        self.model = model_cls(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
@@ -91,7 +115,9 @@ class ModelRunner:
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
+        # GPTQ fp32 dequant 峰值高, 用小 token 热身以控制显存
+        max_num_batched_tokens = min(self.config.max_num_batched_tokens, 256)
+        max_model_len = min(self.config.max_model_len, max_num_batched_tokens)
         seq_len = min(max_num_batched_tokens, max_model_len)
         num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
@@ -109,8 +135,14 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        kv_dtype = torch_dtype = hf_config.torch_dtype
+        if isinstance(kv_dtype, str):
+            kv_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[kv_dtype]
+        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * kv_dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        if config.num_kvcache_blocks <= 0:
+            # 显存估算不足(GPTQ dequant 峰值高), 用保守默认值兜底
+            config.num_kvcache_blocks = 64
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
