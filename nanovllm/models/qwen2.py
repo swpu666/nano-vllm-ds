@@ -39,13 +39,14 @@ class Qwen2Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
 
+        # Qwen2 仅 q/k/v 带 bias; o_proj 与 MLP 均无 bias (已核对 checkpoint 键名)
         self.q_proj = GPTQColumnParallelLinear(hidden_size, self.q_size, bias=qkv_bias, group_size=group_size)
         self.k_proj = GPTQColumnParallelLinear(hidden_size, self.kv_size, bias=qkv_bias, group_size=group_size)
         self.v_proj = GPTQColumnParallelLinear(hidden_size, self.kv_size, bias=qkv_bias, group_size=group_size)
         self.o_proj = GPTQRowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
-            bias=qkv_bias,
+            bias=False,
             group_size=group_size,
         )
         if isinstance(rope_scaling, dict):
@@ -87,15 +88,16 @@ class Qwen2MLP(nn.Module):
         group_size: int = 128,
     ) -> None:
         super().__init__()
-        self.gate_proj = GPTQColumnParallelLinear(hidden_size, intermediate_size, bias=True, group_size=group_size)
-        self.up_proj = GPTQColumnParallelLinear(hidden_size, intermediate_size, bias=True, group_size=group_size)
-        self.down_proj = GPTQRowParallelLinear(intermediate_size, hidden_size, bias=True, group_size=group_size)
+        self.gate_proj = GPTQColumnParallelLinear(hidden_size, intermediate_size, bias=False, group_size=group_size)
+        self.up_proj = GPTQColumnParallelLinear(hidden_size, intermediate_size, bias=False, group_size=group_size)
+        self.down_proj = GPTQRowParallelLinear(intermediate_size, hidden_size, bias=False, group_size=group_size)
         assert hidden_act == "silu"
 
     def forward(self, x):
+        # 与 SiluAndMul 一致: silu(gate) * up (注意不是 gate * silu(up))
         gate = self.gate_proj(x)
         up = self.up_proj(x)
-        x = gate * torch.nn.functional.silu(up)
+        x = torch.nn.functional.silu(gate) * up
         x = self.down_proj(x)
         return x
 
@@ -134,16 +136,15 @@ class Qwen2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # 标准 pre-LN 残差: h = h + attn; h = h + mlp
+        # 沿用 nano-vllm 原始约定: 残差加法与归一化融合 (add-rms-norm),
+        # 层内不做最后的加法, 交由下一层的 input_layernorm (或最终 norm) 完成。
         if residual is None:
-            residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+            hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions, hidden_states)
-        hidden_states = residual + hidden_states
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
         return hidden_states, residual
 
 
@@ -163,13 +164,11 @@ class Qwen2Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids).float()  # 全程 fp32, 避免激活放大溢出
+        hidden_states = self.embed_tokens(input_ids)   # fp16, 该模型权重健康无需 fp32
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
-            # 释放 dequant 临时权重, 控制峰值显存 (每层一次)
-            torch.cuda.empty_cache()
-        hidden_states = self.norm(hidden_states)
+        hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 

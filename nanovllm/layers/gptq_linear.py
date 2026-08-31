@@ -1,7 +1,13 @@
 from __future__ import annotations
+import os
 import torch
 from torch import nn
 import torch.nn.functional as F
+
+# 反量化缓存开关 (也可由环境变量 NANOVLLM_GPTQ_CACHE=1 打开)。
+# 关闭: 每个 forward 都重新 dequant -> 显存省(0.5B/param), 但受限于显存带宽, 极慢;
+# 开启: 只 dequant 一次并缓存 fp16 -> 快, 但显存回到 2B/param (量化只省加载/磁盘)。
+_GPTQ_CACHE = os.getenv("NANOVLLM_GPTQ_CACHE", "0") == "1"
 
 
 def _unpack_qweight(qw: torch.Tensor) -> torch.Tensor:
@@ -29,12 +35,15 @@ def _unpack_qzeros(qz: torch.Tensor) -> torch.Tensor:
 
 class GPTQColumnParallelLinear(nn.Module):
     """GPTQ 4-bit 线性层 (TP=1 退化为整块加载)。"""
-    def __init__(self, input_size: int, output_size: int, bias: bool = False, group_size: int = 128):
+    def __init__(self, input_size: int, output_size: int, bias: bool = False, group_size: int = 128,
+                 cache_dequant: bool | None = None):
         super().__init__()
         self.in_features = input_size
         self.out_features = output_size
         self.group_size = group_size
         self.n_groups = input_size // group_size
+        self.cache_dequant = _GPTQ_CACHE if cache_dequant is None else cache_dequant
+        self._w_cache = None          # 反量化后的 fp16 权重缓存 (惰性构建)
         # 存储布局与 HF GPTQ 一致:
         #   qweight: (in//8, out)
         #   qzeros : (n_groups, out//8)
@@ -46,9 +55,11 @@ class GPTQColumnParallelLinear(nn.Module):
             self.bias = nn.Parameter(torch.zeros(output_size, dtype=torch.float16), requires_grad=False)
         else:
             self.register_parameter("bias", None)
-        # 经数值验证: 该 gptqmodel 新格式 qzeros 直接存真实 zero point (sym 下≈7),
-        # 无需偏移, 直接 W=(Q-Z)*S。若换用 exllama v1 旧格式改为 8。
-        self.zero_offset = 0
+        # GPTQ 标准格式: qzeros 存的是 (真实零点 - 1), 故 真实零点 = qzeros + 1。
+        # 实测验证(sym=true): 本模型 qzeros 恒为 7, 而解包码字 mean(Q)≈7.998≈8,
+        # 即真实零点=8=qzeros+1; 若直接用 qzeros(=7) 反量化, 权重会整体偏移 +1·scale
+        # (实测 mean(W)=+0.00746 ≈ scales.mean()=0.00747, 与偏移一个 scale 完全吻合)。
+        self.zero_point_bias = 1
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, shard_id=None):
         param.data.copy_(loaded_weight)
@@ -63,23 +74,38 @@ class GPTQColumnParallelLinear(nn.Module):
         z = _unpack_qzeros(qz).float().unsqueeze(-1)       # (rows, ngroups, 1)
         s = sc.transpose(0, 1).float().unsqueeze(-1)       # (rows, ngroups, 1)
         w = w.float().reshape(nb, self.n_groups, self.group_size)
-        w = (w - (z - self.zero_offset)) * s
+        w = (w - (z + self.zero_point_bias)) * s
         return w.reshape(nb, self.in_features)
 
+    def _cached_weight(self) -> torch.Tensor:
+        """首次调用时反量化整块权重并缓存 fp16, 随后释放 int4 打包权重以省显存。"""
+        if self._w_cache is None:
+            w = self._dequant_block(0, self.out_features).half()
+            for name in ("qweight", "qzeros", "scales"):
+                p = getattr(self, name, None)
+                if isinstance(p, nn.Parameter):
+                    p.data = torch.empty(0, dtype=p.dtype, device=p.device)
+            self._w_cache = w
+        return self._w_cache
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 分块 dequant + fp32 matmul, 控制峰值显存 (退化模型激活 std 大, 需 fp32)
-        out_features = self.out_features
-        xf = x.float()
-        block = 2048 if out_features > 4096 else out_features
-        parts = []
-        for start in range(0, out_features, block):
-            end = min(start + block, out_features)
-            wb = self._dequant_block(start, end)           # (block, in) fp32
-            parts.append(xf @ wb.t())
-        out = torch.cat(parts, dim=-1)
+        xf = x.half()
+        if self.cache_dequant:
+            out = xf @ self._cached_weight().t()
+        else:
+            # 分块 dequant + fp16 matmul (TensorCore, 内部 fp32 累加), 控制峰值显存。
+            # 权重反量化在 fp32 下完成再转 fp16, 保证精度; 激活全程 fp16, 与 vLLM 对齐。
+            out_features = self.out_features
+            block = 2048 if out_features > 4096 else out_features
+            parts = []
+            for start in range(0, out_features, block):
+                end = min(start + block, out_features)
+                wb = self._dequant_block(start, end).half()  # (block, in)
+                parts.append(xf @ wb.t())
+            out = torch.cat(parts, dim=-1)
         if self.bias is not None:
-            out = out + self.bias.float()
-        return out.to(x.dtype)
+            out = out + self.bias
+        return out
 
 
 class GPTQRowParallelLinear(GPTQColumnParallelLinear):

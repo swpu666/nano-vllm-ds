@@ -36,6 +36,8 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
+        if not hasattr(self, "model_runner"):   # 幂等, 避免 atexit 重复调用报错
+            return
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:

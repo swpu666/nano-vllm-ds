@@ -1,98 +1,213 @@
-import time
+"""
+GPTQ 部署性能对比: nano-vllm-ds (朴素 dequant)  vs  vLLM (gptq_marlin)
+
+指标定义(两引擎口径一致, 保证可比):
+  TTFT      : 单请求从提交到产出首个 token 的时延 (ms)
+  Decode    : 单请求在首 token 之后的解码速度 (tok/s)
+  Throughput: 多请求并发时的总生成吞吐 (tok/s), 体现调度/批处理能力
+"""
+import os
 import argparse
+from time import perf_counter
 
-from nanovllm.llm import LLM
-from nanovllm.sampling_params import SamplingParams
+DEFAULT_MODEL = "/nas_data/WR/models/Qwen2.5-7B-Instruct-GPTQ-Int4"
+
+PROMPTS = [
+    "Please explain the difference between TCP and UDP in detail.",
+    "Write a Python function to compute the Fibonacci sequence recursively.",
+    "What are the main causes of climate change and its impacts?",
+    "Summarize the plot of Romeo and Juliet in three sentences.",
+]
+
+# nano-vLLM 的 SamplingParams 禁止 greedy, 用小 temperature 近似确定性采样
+TEMPERATURE = 0.8
 
 
-def bench_nanovllm(model, prompts, max_tokens):
-    """用 add_request + step 精确测量 TTFT 与 decode 吞吐。"""
-    llm = LLM(model, tensor_parallel_size=1, max_num_batched_tokens=256,
+def _stats(name, ttfts, decodes, throughput=None, extra=""):
+    def avg(xs):
+        return sum(xs) / len(xs) if xs else 0.0
+    line = f"  TTFT(avg)  : {avg(ttfts):8.1f} ms"
+    if ttfts:
+        line += f"   [min {min(ttfts):.1f} / max {max(ttfts):.1f}]"
+    print(line)
+    if decodes:
+        print(f"  Decode(avg): {avg(decodes):8.1f} tok/s (单请求)")
+    if throughput:
+        print(f"  Throughput : {throughput:8.1f} tok/s ({len(PROMPTS)} 请求并发) {extra}")
+    return avg(ttfts), avg(decodes), throughput
+
+
+def bench_nanovllm(model, max_tokens):
+    from nanovllm.llm import LLM
+    from nanovllm.sampling_params import SamplingParams
+
+    llm = LLM(model, tensor_parallel_size=1, max_num_batched_tokens=2048,
               max_num_seqs=4, max_model_len=1024)
-    sp = SamplingParams(temperature=0.8, max_tokens=max_tokens)
-    # 预热一次, 避免首次 CUDA 初始化影响计时
+    sp = SamplingParams(temperature=TEMPERATURE, max_tokens=max_tokens)
+    # 预热, 消除首次 CUDA/显存分配的影响
     llm.generate(["warm-up prompt"], sp, use_tqdm=False)
 
-    ttfts, decode_tps, outputs = [], [], []
-    for p in prompts:
-        t_req = time.perf_counter()
+    ttfts, decodes = [], []
+    for p in PROMPTS:
         llm.add_request(p, sp)
-        ttft = None
-        decode_start = None
-        decode_num = 0
-        out_ids = []
+        t0 = perf_counter()
+        _, num_tokens = llm.step()          # 首个 step = prefill, 产出首 token
+        ttft = (perf_counter() - t0) * 1000
+        n_decode = 0
+        t_dec = perf_counter()
         while not llm.is_finished():
-            outputs_step, num_tokens = llm.step()
-            if num_tokens > 0 and ttft is None:
-                ttft = time.perf_counter() - t_req       # prefill 完成即首 token
-                decode_start = time.perf_counter()
-            elif num_tokens < 0:
-                decode_num += -num_tokens
-            for seq_id, token_ids in outputs_step:
-                out_ids = token_ids
-        outputs.append(out_ids)
-        ttfts.append(ttft * 1000 if ttft else 0.0)
-        if decode_num > 1 and decode_start:
-            decode_tps.append((decode_num - 1) / (time.perf_counter() - decode_start))
+            _, nt = llm.step()
+            if nt < 0:
+                n_decode += -nt             # decode: num_tokens = -len(seqs)
+        elapsed = perf_counter() - t_dec
+        ttfts.append(ttft)
+        if elapsed > 0 and n_decode > 0:
+            decodes.append(n_decode / elapsed)
+
+    # 并发吞吐
+    t0 = perf_counter()
+    outs = llm.generate(PROMPTS, sp, use_tqdm=False)
+    total = sum(len(o["token_ids"]) for o in outs)
+    tput = total / (perf_counter() - t0)
+
+    mode = "权重缓存(fp16, dequant 一次)" if os.getenv("NANOVLLM_GPTQ_CACHE") == "1" \
+        else "朴素 on-the-fly dequant(每次 forward 重算)"
+    print(f"=== nano-vllm-ds (GPTQ, TP=1) [{mode}] ===")
+    _stats("nanovllm", ttfts, decodes, tput)
     del llm
-    return outputs, ttfts, decode_tps
+    return ttfts, decodes, tput
 
 
-def bench_vllm(model, prompts, max_tokens):
+def _vllm_ttft(llm, vsp_cls, prompt):
+    """单请求 TTFT: 优先用 vLLM 内建 metrics, 否则退化为 max_tokens=1 计时。"""
+    from vllm import SamplingParams as VSP
+    sp1 = VSP(temperature=0.0, max_tokens=1)
+    out = llm.generate([prompt], sp1, use_tqdm=False)[0]
+    m = getattr(out, "metrics", None)
+    if m is not None:
+        ft, at = getattr(m, "first_token_time", None), getattr(m, "arrival_time", None)
+        if ft and at:
+            return (ft - at) * 1000
+    # 退化方案: max_tokens=1 的端到端耗时 ≈ prefill 时延
+    t0 = perf_counter()
+    llm.generate([prompt], sp1, use_tqdm=False)
+    return (perf_counter() - t0) * 1000
+
+
+def bench_vllm(model, max_tokens):
     from vllm import LLM as VLLM
     from vllm import SamplingParams as VSP
-    llm = VLLM(model=model, quantization="gptq", dtype="half",
-               gpu_memory_utilization=0.92, enforce_eager=True,
+
+    llm = VLLM(model=model, quantization="gptq_marlin", dtype="half",
+               gpu_memory_utilization=0.5, enforce_eager=True,
                max_model_len=1024, max_num_seqs=4)
-    vsp = VSP(temperature=0.8, top_p=0.95, max_tokens=max_tokens)
-    ttfts, decode_tps, outputs = [], [], []
-    for p in prompts:
-        t_req = time.perf_counter()
-        # 单请求测量 TTFT
-        ttft = None
-        gen = llm.generate([p], vsp, use_tqdm=False)
-        # vLLM 不直接暴露 TTFT, 用整体耗时近似(单请求下 ≈ prefill+decode)
-        ttft = time.perf_counter() - t_req
-        out_ids = gen[0].outputs[0].token_ids
-        outputs.append(out_ids)
-        ttfts.append(ttft * 1000)
-    # decode 吞吐: 所有输出 token / 总耗时
-    total_tokens = sum(len(o) for o in outputs)
-    t0 = time.perf_counter()
-    llm.generate(prompts, vsp, use_tqdm=False)
-    decode_tps.append(total_tokens / (time.perf_counter() - t0))
-    return outputs, ttfts, decode_tps
+    vsp = VSP(temperature=TEMPERATURE, top_p=0.95, max_tokens=max_tokens)
+    # 预热
+    llm.generate(["warm-up prompt"], vsp, use_tqdm=False)
+
+    ttfts = [_vllm_ttft(llm, VSP, p) for p in PROMPTS]
+
+    # 单请求 decode 速度: 用整体耗时近似 (vLLM 离线 API 不拆分首 token 边界)
+    decodes = []
+    for p in PROMPTS:
+        t0 = perf_counter()
+        out = llm.generate([p], vsp, use_tqdm=False)[0]
+        n = len(out.outputs[0].token_ids)
+        elapsed = perf_counter() - t0
+        if n > 1 and elapsed > 0:
+            decodes.append((n - 1) / elapsed)
+
+    # 并发吞吐
+    t0 = perf_counter()
+    outs = llm.generate(PROMPTS, vsp, use_tqdm=False)
+    total = sum(len(o.outputs[0].token_ids) for o in outs)
+    tput = total / (perf_counter() - t0)
+
+    print("=== vLLM (gptq_marlin, enforce_eager) ===")
+    _stats("vllm", ttfts, decodes, tput)
+    return ttfts, decodes, tput
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="/nas_data/WR/models/DeepSeek-R1-Distill-Qwen-32B-GPTQ-Int4")
+    parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--max_tokens", type=int, default=128)
-    parser.add_argument("--engine", default="nanovllm", choices=["nanovllm", "vllm", "both"])
+    parser.add_argument("--engine", default="both",
+                        choices=["nanovllm", "nanovllm-cache", "vllm", "both", "all"])
+    parser.add_argument("--json", action="store_true", help="机器可读输出, 供子进程间传递结果")
     args = parser.parse_args()
 
-    prompts = [
-        "Please explain the difference between TCP and UDP in detail.",
-        "Write a Python function to compute the Fibonacci sequence recursively.",
-        "What are the main causes of climate change and its impacts?",
-        "Summarize the plot of Romeo and Juliet in three sentences.",
-    ]
+    # 单引擎: 直接测量
+    if args.engine == "nanovllm":
+        ttfts, decodes, tput = bench_nanovllm(args.model, args.max_tokens)
+        _emit_json(args, ttfts, decodes, tput) if args.json else None
+        return
+    if args.engine == "nanovllm-cache":
+        os.environ["NANOVLLM_GPTQ_CACHE"] = "1"
+        ttfts, decodes, tput = bench_nanovllm(args.model, args.max_tokens)
+        _emit_json(args, ttfts, decodes, tput) if args.json else None
+        return
+    if args.engine == "vllm":
+        ttfts, decodes, tput = bench_vllm(args.model, args.max_tokens)
+        _emit_json(args, ttfts, decodes, tput) if args.json else None
+        return
 
-    if args.engine in ("nanovllm", "both"):
-        print("=== nano-vllm-ds (GPTQ naive dequant, TP=1) ===")
-        outputs, ttfts, decode_tps = bench_nanovllm(args.model, prompts, args.max_tokens)
-        avg_ttft = sum(ttfts) / len(ttfts)
-        avg_tps = sum(decode_tps) / len(decode_tps) if decode_tps else 0.0
-        for p, o in zip(prompts, outputs):
-            print(f"  [prompt] {p[:40]!r}\n    -> {o[:40]}")
-        print(f"  Avg TTFT: {avg_ttft:.1f} ms | Avg decode: {avg_tps:.1f} tok/s")
+    # 多引擎: 各起独立子进程, 避免 CUDA 显存/上下文互相干扰
+    engines = ["nanovllm", "nanovllm-cache", "vllm"] if args.engine == "all" else ["nanovllm", "vllm"]
+    res = {}
+    for eng in engines:
+        print(f"########## 运行 {eng} (独立子进程) ##########")
+        res[eng] = _run_subprocess(eng, args)
+        print()
+    _compare(res)
 
-    if args.engine in ("vllm", "both"):
-        print("=== vLLM (GPTQ Marlin) ===")
-        outputs, ttfts, decode_tps = bench_vllm(args.model, prompts, args.max_tokens)
-        avg_ttft = sum(ttfts) / len(ttfts)
-        avg_tps = sum(decode_tps) / len(decode_tps) if decode_tps else 0.0
-        print(f"  Avg TTFT: {avg_ttft:.1f} ms | Avg decode: {avg_tps:.1f} tok/s")
+
+def _emit_json(args, ttfts, decodes, tput):
+    import json
+    print("JSON_RESULT " + json.dumps({"ttfts": ttfts, "decodes": decodes, "tput": tput}))
+
+
+def _run_subprocess(engine, args):
+    import json
+    import subprocess
+    import sys
+    cmd = [sys.executable, __file__, "--engine", engine, "--model", args.model,
+           "--max_tokens", str(args.max_tokens), "--json"]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    print(proc.stdout.rstrip())
+    if proc.returncode != 0:
+        print(f"[WARN] {engine} 失败 (rc={proc.returncode}):")
+        print((proc.stderr or "")[-1500:])
+        return None
+    for line in proc.stdout.splitlines():
+        if line.startswith("JSON_RESULT "):
+            return json.loads(line[len("JSON_RESULT "):])
+    return None
+
+
+def _compare(res):
+    rows = []
+    for name, r in res.items():
+        if not r:
+            continue
+        tt = sum(r["ttfts"]) / len(r["ttfts"]) if r["ttfts"] else 0.0
+        dc = sum(r["decodes"]) / len(r["decodes"]) if r["decodes"] else 0.0
+        rows.append((name, tt, dc, r["tput"]))
+    if len(rows) < 2:
+        return
+    print("=== 对比汇总 ===")
+    print(f"{'engine':<16}{'TTFT(ms)':>12}{'Decode(t/s)':>14}{'Throughput(t/s)':>18}")
+    for name, tt, dc, tp in rows:
+        print(f"{name:<16}{tt:>12.1f}{dc:>14.1f}{tp:>18.1f}")
+    base = next((r for r in rows if r[0] == "vllm"), None)
+    if base:
+        print("\n(相对 vLLM 的倍数, TTFT 越低越好, 吞吐越高越好)")
+        for name, tt, dc, tp in rows:
+            if name == "vllm":
+                continue
+            print(f"  {name:<16} TTFT {tt / base[1] if base[1] else 0:6.2f}x | "
+                  f"Decode {dc / base[2] if base[2] else 0:6.2f}x | "
+                  f"Throughput {tp / base[3] if base[3] else 0:6.2f}x")
 
 
 if __name__ == "__main__":
