@@ -70,8 +70,9 @@ def bench_nanovllm(model, max_tokens):
     total = sum(len(o["token_ids"]) for o in outs)
     tput = total / (perf_counter() - t0)
 
-    mode = "权重缓存(fp16, dequant 一次)" if os.getenv("NANOVLLM_GPTQ_CACHE") == "1" \
-        else "朴素 on-the-fly dequant(每次 forward 重算)"
+    mode = "fused int4 dequant-GEMM (不物化 fp16 权重)" if os.getenv("NANOVLLM_GPTQ_FUSED") == "1" \
+        else ("权重缓存(fp16, dequant 一次)" if os.getenv("NANOVLLM_GPTQ_CACHE") == "1" \
+        else "朴素 on-the-fly dequant(每次 forward 重算)")
     print(f"=== nano-vllm-ds (GPTQ, TP=1) [{mode}] ===")
     _stats("nanovllm", ttfts, decodes, tput)
     del llm
@@ -133,7 +134,7 @@ def main():
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--max_tokens", type=int, default=128)
     parser.add_argument("--engine", default="both",
-                        choices=["nanovllm", "nanovllm-cache", "vllm", "both", "all"])
+                        choices=["nanovllm", "nanovllm-cache", "nanovllm-fused", "vllm", "both", "all"])
     parser.add_argument("--json", action="store_true", help="机器可读输出, 供子进程间传递结果")
     args = parser.parse_args()
 
@@ -147,13 +148,19 @@ def main():
         ttfts, decodes, tput = bench_nanovllm(args.model, args.max_tokens)
         _emit_json(args, ttfts, decodes, tput) if args.json else None
         return
+    if args.engine == "nanovllm-fused":
+        os.environ["NANOVLLM_GPTQ_FUSED"] = "1"
+        ttfts, decodes, tput = bench_nanovllm(args.model, args.max_tokens)
+        _emit_json(args, ttfts, decodes, tput) if args.json else None
+        return
     if args.engine == "vllm":
         ttfts, decodes, tput = bench_vllm(args.model, args.max_tokens)
         _emit_json(args, ttfts, decodes, tput) if args.json else None
         return
 
     # 多引擎: 各起独立子进程, 避免 CUDA 显存/上下文互相干扰
-    engines = ["nanovllm", "nanovllm-cache", "vllm"] if args.engine == "all" else ["nanovllm", "vllm"]
+    engines = ["nanovllm", "nanovllm-cache", "nanovllm-fused", "vllm"] if args.engine == "all" \
+        else ["nanovllm", "vllm"]
     res = {}
     for eng in engines:
         print(f"########## 运行 {eng} (独立子进程) ##########")

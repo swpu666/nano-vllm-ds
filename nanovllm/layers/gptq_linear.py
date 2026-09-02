@@ -9,6 +9,18 @@ import torch.nn.functional as F
 # 开启: 只 dequant 一次并缓存 fp16 -> 快, 但显存回到 2B/param (量化只省加载/磁盘)。
 _GPTQ_CACHE = os.getenv("NANOVLLM_GPTQ_CACHE", "0") == "1"
 
+# fused dequant-GEMM (Triton): 权重以 int4 驻留, kernel 内解包反量化直接 tl.dot,
+# 不物化 fp16 权重 -> 省显存与一次 HBM 往返, 是对标 Marlin "免显存往返"的实现。
+# 注意实测: 本硬件(3090/7B)上瓶颈是算力+注意力而非权重带宽, 故 fused 吞吐(77.9 tok/s)
+# 略低于 cache 模式(87.7, cuBLAS 更优化); 且 tl.dot 归约顺序 != cuBLAS, 深残差模型下
+# 贪心解码会与 vLLM 分歧 -> 精确贪心匹配请用 cache 模式。详见教程 5.5。
+try:
+    from nanovllm.layers.gptq_triton import fused_gptq_linear
+    _HAS_TRITON = True
+except Exception:
+    _HAS_TRITON = False
+_FUSED = os.getenv("NANOVLLM_GPTQ_FUSED", "0") == "1" and _HAS_TRITON
+
 
 def _unpack_qweight(qw: torch.Tensor) -> torch.Tensor:
     """
@@ -90,7 +102,9 @@ class GPTQColumnParallelLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         xf = x.half()
-        if self.cache_dequant:
+        if _FUSED:
+            out = self._forward_fused(xf)
+        elif self.cache_dequant:
             out = xf @ self._cached_weight().t()
         else:
             # 分块 dequant + fp16 matmul (TensorCore, 内部 fp32 累加), 控制峰值显存。
@@ -103,6 +117,20 @@ class GPTQColumnParallelLinear(nn.Module):
                 wb = self._dequant_block(start, end).half()  # (block, in)
                 parts.append(xf @ wb.t())
             out = torch.cat(parts, dim=-1)
+        if self.bias is not None:
+            out = out + self.bias
+        return out
+
+    def _forward_fused(self, xf: torch.Tensor) -> torch.Tensor:
+        """fused int4 dequant-GEMM (Triton): 不物化 fp16 权重, 兼顾速度与显存。
+        支持任意前导维度 (引擎在 prefill 时可能传 (batch, seq, in))。"""
+        xc = xf.contiguous()
+        *lead, K = xc.shape
+        x2 = xc.reshape(-1, K)
+        M = x2.shape[0]
+        out = fused_gptq_linear(x2, self.qweight, self.qzeros, self.scales,
+                                M, self.out_features, K, self.group_size)
+        out = out.reshape(*lead, self.out_features)
         if self.bias is not None:
             out = out + self.bias
         return out
