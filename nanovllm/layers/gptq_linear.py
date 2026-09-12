@@ -4,22 +4,41 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-# 反量化缓存开关 (也可由环境变量 NANOVLLM_GPTQ_CACHE=1 打开)。
-# 关闭: 每个 forward 都重新 dequant -> 显存省(0.5B/param), 但受限于显存带宽, 极慢;
-# 开启: 只 dequant 一次并缓存 fp16 -> 快, 但显存回到 2B/param (量化只省加载/磁盘)。
+# 四条执行路径 (环境变量在 import 时读取; 默认 fused, 见下方说明):
+#
+#   fused (默认)  Triton dequant-GEMM, fp16 权重完全不物化 (对标 Marlin, 这才是真正
+#                的"重写 GEMM")。显存 5.2GiB (0.5B/param, 量化的真实收益), 吞吐 ~77 tok/s,
+#                Part C 与 vLLM(gptq_marlin) 64/64 对齐 —— 同显存下比 stream 快 1.3x。
+#                与 cuBLAS 相比: prefill(M>=32) 逐位一致, decode(M<=4) 有 1~4 ulp 差异,
+#                但这点差异**不足以**造成贪心分歧 (实测仍 64/64)。
+#   stream        int4 常驻显存, 每次 forward 用 Triton kernel 把权重展开到一个**复用**的
+#                fp16 暂存区, 再交给 cuBLAS。显存同 fused, 但多了展开+回读的带宽开销
+#                (~59 tok/s)。数值上与 cache 模式逐位相同, 适合作为 fused 的对照基准。
+#   cache         只 dequant 一次并长期缓存 fp16。最快 (~89 tok/s), 但显存回到 2B/param
+#                (14.2GiB), 放弃了量化的运行期收益 —— 只作为"速度上界"参照。
+#   torch         旧朴素实现 (torch 张量运算解包), 访存量约为权重的 30 倍, 仅作对照。
+#
+# 重要历史教训: fused 曾长期 0/64, 一度被归因为"tl.dot 归约顺序与 cuBLAS 不同"。
+# 实测证伪 —— 真因是 bias 被加了两次 (_forward_fused 内一次, forward() 又一次),
+# 而 Qwen2 中只有 q/k/v 投影带 bias, 所以只有这三个投影整体偏移一个 bias。
+# 归约顺序造成的 1~4 ulp 并不足以让贪心解码分歧。详见 _forward_fused 的注释。
 _GPTQ_CACHE = os.getenv("NANOVLLM_GPTQ_CACHE", "0") == "1"
+_GPTQ_TORCH = os.getenv("NANOVLLM_GPTQ_TORCH", "0") == "1"
+_GPTQ_STREAM = os.getenv("NANOVLLM_GPTQ_STREAM", "0") == "1"
 
-# fused dequant-GEMM (Triton): 权重以 int4 驻留, kernel 内解包反量化直接 tl.dot,
-# 不物化 fp16 权重 -> 省显存与一次 HBM 往返, 是对标 Marlin "免显存往返"的实现。
-# 注意实测: 本硬件(3090/7B)上瓶颈是算力+注意力而非权重带宽, 故 fused 吞吐(77.9 tok/s)
-# 略低于 cache 模式(87.7, cuBLAS 更优化); 且 tl.dot 归约顺序 != cuBLAS, 深残差模型下
-# 贪心解码会与 vLLM 分歧 -> 精确贪心匹配请用 cache 模式。详见教程 5.5。
 try:
-    from nanovllm.layers.gptq_triton import fused_gptq_linear
+    from nanovllm.layers.gptq_triton import (fused_gptq_linear, ordered_gptq_linear,
+                                             ORDERED_MAX_M)
     _HAS_TRITON = True
 except Exception:
+    ORDERED_MAX_M = 0
     _HAS_TRITON = False
 _FUSED = os.getenv("NANOVLLM_GPTQ_FUSED", "0") == "1" and _HAS_TRITON
+_HAS_DEQUANT = True
+try:
+    from nanovllm.layers.gptq_dequant import dequantize_gptq, scratch_buffer
+except Exception:
+    _HAS_DEQUANT = False
 
 
 def _unpack_qweight(qw: torch.Tensor) -> torch.Tensor:
@@ -55,6 +74,12 @@ class GPTQColumnParallelLinear(nn.Module):
         self.group_size = group_size
         self.n_groups = input_size // group_size
         self.cache_dequant = _GPTQ_CACHE if cache_dequant is None else cache_dequant
+        self.mode = ("fused" if _FUSED else
+                     "cache" if self.cache_dequant else
+                     "torch" if _GPTQ_TORCH or not _HAS_DEQUANT else
+                     "stream" if _GPTQ_STREAM else
+                     "fused" if _HAS_TRITON else
+                     "stream")
         self._w_cache = None          # 反量化后的 fp16 权重缓存 (惰性构建)
         # 存储布局与 HF GPTQ 一致:
         #   qweight: (in//8, out)
@@ -102,12 +127,14 @@ class GPTQColumnParallelLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         xf = x.half()
-        if _FUSED:
+        if self.mode == "fused":
             out = self._forward_fused(xf)
-        elif self.cache_dequant:
+        elif self.mode == "cache":
             out = xf @ self._cached_weight().t()
+        elif self.mode == "stream":
+            out = self._forward_stream(xf)
         else:
-            # 分块 dequant + fp16 matmul (TensorCore, 内部 fp32 累加), 控制峰值显存。
+            # 旧朴素路径: 分块 dequant + fp16 matmul (TensorCore, 内部 fp32 累加)。
             # 权重反量化在 fp32 下完成再转 fp16, 保证精度; 激活全程 fp16, 与 vLLM 对齐。
             out_features = self.out_features
             block = 2048 if out_features > 4096 else out_features
@@ -121,18 +148,34 @@ class GPTQColumnParallelLinear(nn.Module):
             out = out + self.bias
         return out
 
+    def _forward_stream(self, xf: torch.Tensor) -> torch.Tensor:
+        """int4 常驻显存: Triton 把权重展开到复用的 fp16 暂存区, 再用 cuBLAS 做 GEMM。
+        展开结果与 cache 模式逐位一致 -> 数值行为与 cache/vLLM 对齐;
+        显存只多出一个最大层大小的 buffer (7B 约 136MB), 而不是整模型的 14GB。"""
+        W = dequantize_gptq(self.qweight, self.qzeros, self.scales,
+                            group_size=self.group_size,
+                            out=scratch_buffer(self.out_features * self.in_features, xf.device))
+        return xf @ W.t()
+
     def _forward_fused(self, xf: torch.Tensor) -> torch.Tensor:
-        """fused int4 dequant-GEMM (Triton): 不物化 fp16 权重, 兼顾速度与显存。
+        """int4 dequant-GEMM 混合核: 不物化 fp16 权重 (显存 0.5B/param), 且数值与 vLLM 对齐。
+
+          M <= ORDERED_MAX_M (decode + 短 prefill) -> ordered 核: dequant 后升 fp32 精确乘加
+          M >  ORDERED_MAX_M (长 prefill)         -> tl.dot 核: 已验证与 cuBLAS 逐位一致
+
+        短 prompt 的 prefill M 只有 10~30, 必须走 ordered —— 否则 prefill 就错了。
         支持任意前导维度 (引擎在 prefill 时可能传 (batch, seq, in))。"""
         xc = xf.contiguous()
         *lead, K = xc.shape
         x2 = xc.reshape(-1, K)
         M = x2.shape[0]
-        out = fused_gptq_linear(x2, self.qweight, self.qzeros, self.scales,
-                                M, self.out_features, K, self.group_size)
+        fn = ordered_gptq_linear if M <= ORDERED_MAX_M else fused_gptq_linear
+        out = fn(x2, self.qweight, self.qzeros, self.scales,
+                 M, self.out_features, K, self.group_size)
         out = out.reshape(*lead, self.out_features)
-        if self.bias is not None:
-            out = out + self.bias
+        # 注意: bias 由 forward() 统一加, 这里**不能**再加一次。
+        # 历史上这里多加了一次 -> q/k/v (Qwen2 中唯一带 bias 的投影) 结果整体偏移一个 bias,
+        # 这正是 fused 模式端到端 0/64 的真正主因 (而非 tl.dot 的归约顺序)。
         return out
 
 

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import pickle
 import torch
 import torch.distributed as dist
@@ -42,7 +43,10 @@ class ModelRunner:
             qcfg = hf_config.quantization_config
             hf_config.group_size = qcfg.get("group_size", 128)
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        # 端口可用 NANOVLLM_MASTER_PORT 覆盖: 同机并行跑多个实例/测试时避免 2333 冲突
+        port = os.getenv("NANOVLLM_MASTER_PORT", "2333")
+        dist.init_process_group("nccl", f"tcp://localhost:{port}",
+                                world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch_dtype = hf_config.torch_dtype

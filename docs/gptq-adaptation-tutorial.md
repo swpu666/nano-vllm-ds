@@ -1,64 +1,95 @@
-# nano-vLLM 适配 GPTQ 4-bit 量化模型：从原理到落地（教程 + Infra 简历项目）
+# nano-vLLM 适配 GPTQ-Int4 量化模型：从原理到落地（教程 + Infra 简历项目）
 
-> 适用对象：想在极简推理引擎（nano-vLLM，~2000 行）里手搓量化支持、或想理解 GPTQ/vLLM/Marlin 工程差异的工程师。
-> 代码基准：本仓库当前实现（`nanovllm/layers/gptq_linear.py`、`nanovllm/models/qwen2.py` 等）。
-> 硬件：单卡 RTX 3090 24GB。模型：`Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4`（GPTQ-Int4, sym, group_size=128, desc_act=False）。
-
----
-
-# 第一部分：nano-vLLM 如何适配量化模型
-
-## 0. 背景与动机
-
-nano-vLLM 本来只支持 **fp16 全精度**权重（`nanovllm/layers/linear.py` 里的 `Linear` 直接 `F.linear(x, w.half())`）。把量化模型塞进去，价值是：
-
-- **显存**：7B 模型 fp16 约 14GB 权重；GPTQ-Int4 仅约 3.5GB（0.5 byte/param），单机 24GB 卡能放下更大的模型/更长的 KV cache。
-- **带宽**：权重读取量降到 1/4，解码阶段受限于权重带宽（memory-bound），理论上解码吞吐可大幅提升。
-- **学习价值**：量化推理的真正难点不在“矩阵乘”，而在**反量化（dequant）怎么和 GEMM 融合**、**零点/打包约定怎么对齐**——这正是 vLLM Marlin、AWQ kernel 的核心。
-
-本教程覆盖：GPTQ 磁盘格式 → bit 解包 → 零点约定（最易踩坑）→ 反量化数学 → 与引擎各模块的对接 → 正确性验证 → 性能瓶颈与优化。
+> **适用对象**：想在极简推理引擎（nano-vLLM，~2000 行）里手搓量化支持、或想理解 GPTQ / vLLM / Marlin 工程差异的工程师。
+> **代码基准**：本仓库当前实现，主要是 `nanovllm/layers/gptq_linear.py`、`gptq_dequant.py`、`gptq_triton.py` 与 `nanovllm/models/qwen2.py`。
+> **硬件**：单卡 RTX 3090 24GB。**模型**：`Qwen2.5-7B-Instruct-GPTQ-Int4`（GPTQ-Int4, sym, group_size=128, desc_act=False）。
 
 ---
 
-## 1. GPTQ 格式速成（必须懂，否则一定写错）
+## 0. 速览（先看这一节）
 
-GPTQ 是 **weight-only 对称量化**：每个权重用一个 4-bit 整数码字表示，反量化公式
+### 0.1 四条执行路径
+
+引擎里有 **四条** GPTQ 执行路径，靠环境变量在模块导入时选择。**默认是 `fused`**（不设任何开关即生效）：
+
+| 路径 | 开关 | 权重显存 | 与 vLLM 数值关系 | 4 并发吞吐 (tok/s) | 定位 |
+|---|---|---|---|---|---|
+| **fused**（默认） | 无开关，或 `NANOVLLM_GPTQ_FUSED=1` | **5.20 GiB** | 逐 token 一致（**64/64**） | **77.4** | 默认：省显存 + 精确 + 最快 |
+| stream | `NANOVLLM_GPTQ_STREAM=1` | **5.20 GiB** | 逐 token 一致（64/64） | 58.8 | 省显存，作为 fused 的对照基准 |
+| cache | `NANOVLLM_GPTQ_CACHE=1` | 14.20 GiB | 逐 token 一致（64/64） | 89.0 | 速度上界对照（放弃显存收益） |
+| torch | `NANOVLLM_GPTQ_TORCH=1` | 5.20 GiB | 逐 token 一致（64/64） | 8.5 | 朴素参考实现 |
+| *（参考）vLLM gptq_marlin* | — | — | 基准 | 344.4 | 行业上限 |
+
+> `NANOVLLM_GPTQ_STREAM=1` 用于显式退回 stream 路径（fused 是默认，故需要这个开关才能测到 stream）。
+
+### 0.2 四个核心结论
+
+1. **零点是唯一必踩的坑**：GPTQ(v1) 磁盘上的 `qzeros` 存的是「真实零点 − 1」，即 `z_true = unpack(qzeros) + 1`。用错不会报错，只会让输出看似流畅但内容错乱。
+2. **正确性要用强证据**：`mean(码字)≈真实零点` 这类弱启发式在有偏分布下会误判；正确做法是「黄金权重无损往返 + 变异测试」（见 §4）。
+3. **量化的显存收益由 `stream` 路径兑现**：int4 权重常驻显存只占 5.2 GiB，而 `cache` 模式反量化成 fp16 会膨胀到 14.2 GiB。`cache` 只是「精度/速度上界」的对照基准，**不能**拿它论证"量化没用"。
+4. **光把反量化融进 kernel 并不等于 Marlin**：`fused` 路径不物化 fp16 权重、吞吐 78.1 tok/s，但 `tl.dot` 的归约顺序与 cuBLAS 不同，decode 形状有 1~4 ulp 差异，被 28 层残差 + softmax 放大后贪心解码 0/64 匹配。**融合反量化 + 同款归约顺序**才是完整答案。
+
+### 0.3 阅读地图
+
+- **只想跑起来**：§9 复现命令。
+- **想理解实现**：第一部分（§1 格式 → §2 改动点 → §3 实现）。
+- **想验证正确性**：第二部分（§4）。
+- **想做性能分析**：第三部分（§5–§8）。
+- **写简历 / 准备面试**：第五部分。
+
+---
+
+# 第一部分：原理与适配实现
+
+## 1. GPTQ 格式速成（不懂一定写错）
+
+GPTQ 是 **weight-only 对称量化**：每个权重用一个 4-bit 整数码字表示。
 
 ```
 W[i] = (Q[i] - z[g]) * s[g]        # g = i // group_size
 ```
 
-- `Q`：4-bit 整数码字（int8 存储但只取低 4 位）。
-- `z[g]`：group `g` 的**零点（zero point）**。对称量化下 GPTQ 的 `z` 由码字统计决定（`z ≈ round(mean(Q))`），但**磁盘上存的不是 `z` 本身**，见 1.3 的“零点约定”坑。
+- `Q`：4-bit 整数码字（用 int8/int32 存储，只取低 4 位，取值 `[0,15]`）。
+- `z[g]`：group `g` 的零点；对称量化下理论为常数 8，但**磁盘上存的不是 `z` 本身**（见 §1.4）。
 - `s[g]`：group `g` 的 scale，fp16。
-- `group_size`：每个 group 覆盖的连续输入维度（本模型=128）。`n_groups = in_features // group_size`。
+- `group_size`：每个 group 覆盖的连续输入维度（本模型 = 128），`n_groups = in_features // group_size`。
 
-### 1.1 磁盘上的三张表及其形状
+### 1.1 磁盘上的三张表
 
-HF 的 `*.safetensors` 里，每个线性层存三张表（`g_idx` 在 `group_size` 对齐时可忽略，本实现直接跳过）：
+HF 的 `*.safetensors` 里每个线性层存三张表（`g_idx` 在 group 对齐时可忽略，本实现直接跳过）：
 
 | 张量 | 形状 | dtype | 含义 |
 |---|---|---|---|
 | `qweight` | `(in_features // 8, out_features)` | int32 | 每 int32 打包 8 个 4-bit 码字，沿**输入维**打包 |
-| `qzeros`  | `(in_features // group_size, out_features // 8)` | int32 | 每 int32 打包 8 个 4-bit 零点，沿**输出维**打包 |
-| `scales`  | `(in_features // group_size, out_features)` | fp16 | 每 group 一个 scale |
+| `qzeros` | `(in_features // group_size, out_features // 8)` | int32 | 每 int32 打包 8 个 4-bit 零点，沿**输出维**打包 |
+| `scales` | `(in_features // group_size, out_features)` | fp16 | 每 group 一个 scale |
 
-> 直觉：`qweight` 的 `(in//8, out)` 是因为 32 bit / 4 bit = 8，把输入方向每 8 个权重的 4-bit 码字挤进一个 int32；`qzeros` 是 `(out//8)` 同理但沿输出方向。
+直觉：32 bit / 4 bit = 8，所以 `qweight` 沿输入方向每 8 个码字挤进一个 int32（形状里出现 `in//8`），`qzeros` 沿输出方向同理（出现 `out//8`）。
 
 ### 1.2 打包方向（决定解包代码怎么写）
 
-- **`qweight`**：固定输出 `o` 不变，输入索引 `[8m, 8m+7)` 的 8 个码字挤进同一个 int32。低位 4 bit = 输入索引 `8m`（第一个元素）。
-- **`qzeros`**：固定 group `g` 不变，输出索引 `[8m, 8m+7)` 的 8 个零点挤进同一个 int32。同样低位在前。
+- **`qweight`**：固定输出 `o`，输入索引 `[8m, 8m+7)` 的 8 个码字挤进同一个 int32；**低位 4 bit = 输入索引 `8m`**（第一个元素）。
+- **`qzeros`**：固定 group `g`，输出索引 `[8m, 8m+7)` 的 8 个零点挤进同一个 int32；同样低位在前。
 
-### 1.3 零点约定（**全文最重要的坑**）
+一句话记忆：**权重沿 K（输入）打包，零点沿 N（输出）打包，都是小端 nibble（低位在前）**。
 
-标准 GPTQ（v1，非 GPTQ-V2）磁盘上的 `qzeros` 存的是 **真实零点 − 1**：
+### 1.3 反量化公式展开
+
+逐元素等价于：
+
+```
+W[n, k] = (Q[n, k] - (unpack(qzeros)[n, g] + 1)) * scales[g, n],   g = k // group_size
+```
+
+### 1.4 零点约定（**全文最重要的坑**）
+
+标准 GPTQ（v1，非 GPTQ-v2）磁盘上的 `qzeros` 存的是 **真实零点 − 1**：
 
 ```
 z_true = unpack(qzeros) + 1
 ```
 
-权威出处（vLLM 源码）：`vllm/.../quantization/utils/bitblas_utils.py` 的 `unpack_gptq_qzeros`：
+权威出处（vLLM 源码 `vllm/.../quantization/utils/bitblas_utils.py` 的 `unpack_gptq_qzeros`）：
 
 ```python
 def unpack_gptq_qzeros(qzeros, bits, is_gptq_v2=False):
@@ -68,32 +99,34 @@ def unpack_gptq_qzeros(qzeros, bits, is_gptq_v2=False):
     return unpacked_zeros
 ```
 
-**实测佐证（可直接复用的诊断法）**：对称量化下 `mean(解包后的码字 Q) ≈ 真实零点`。本模型 `qzeros` 恒为 7，而 `mean(Q) ≈ 7.998 ≈ 8`，说明真实零点 = 8 = `qzeros + 1`。
-若误用 `qzeros`（=7）反量化，整张权重会平移 `+1·scale`——实测 `mean(W) = +0.00746`，与 `scales.mean() = 0.00747` **完全吻合**，正好是一个 scale 的系统性偏移。这种偏移不会让 loss 爆炸，但会让生成结果彻底错乱。
+本模型实测佐证：`qzeros` 恒为 7、解包码字 `mean(Q) ≈ 7.998 ≈ 8`，真实零点 = 8 = `qzeros + 1`。若误用 `qzeros`（=7）反量化，整张权重会平移 `+1·scale`——实测 `mean(W) = +0.00746`，与 `scales.mean() = 0.00747` **完全吻合**，正好一个 scale 的系统性偏移。
 
-> 这正是之前“DeepSeek 模型退化”的真正原因：**不是模型坏，是 dequant 零点偏移**。可见“看起来能跑但输出乱码”的 bug，定位要靠数值不变量而非肉眼。
-
----
-
-## 2. nano-vLLM 原有结构（要改哪些地方）
-
-- `nanovllm/layers/linear.py`：fp16 的 `Linear` / `QKVParallelLinear` / `ColumnParallelLinear` / `RowParallelLinear`。
-- `nanovllm/engine/model_runner.py`：`MODEL_REGISTRY` 把 HF `architectures[0]` 映射到模型类；`load_model()` 加载权重。
-- `nanovllm/config.py`：`Config.quantization` 字段，从 `hf_config.quantization_config` 自动识别 `"gptq"`。
-- `nanovllm/utils/loader.py`：`load_model()`，把 safetensors 张量 `copy_` 到 `nn.Parameter`。
-
-我们的策略是**不破坏 fp16 路径**，新增一套 `GPTQ*ParallelLinear`（复用 fp16 版本的 `weight_loader` 与 TP 切分逻辑），并新增 `Qwen2ForCausalLM` 模型类（Qwen2 与 Qwen3 主要差异是 Qwen2 的 q/k/v/o 是**分开的**投影、MLP 也是 `gate/up` 分开，因此不需要 `packed_modules_mapping` 融合）。
+> 这正是之前"DeepSeek 模型退化"的真正原因：**不是模型坏，是 dequant 零点偏移**。这类"看起来能跑但输出乱码"的 bug，定位要靠数值不变量而非肉眼（见 §4）。
 
 ---
 
-## 3. 适配实现（核心代码）
+## 2. nano-vLLM 原有结构与改动清单
 
-### 3.1 参数与存储布局
+| 原有文件 | 作用 | GPTQ 需要做什么 |
+|---|---|---|
+| `nanovllm/layers/linear.py` | fp16 的 `Linear` / `QKVParallelLinear` 等 | 新增平行的 `GPTQ*ParallelLinear`，**不动 fp16 路径** |
+| `nanovllm/config.py` | `Config` | 加 `quantization` 字段，从 `hf_config.quantization_config` 自动识别 `"gptq"` |
+| `nanovllm/utils/loader.py` | `load_model()` | 识别 `qweight/qzeros/scales` 后缀，`copy_` 进 `nn.Parameter` |
+| `nanovllm/engine/model_runner.py` | `MODEL_REGISTRY` + `load_model()` | 注册 `Qwen2ForCausalLM`；GPTQ 时强制 eager；注入 `group_size` |
+| `nanovllm/models/qwen2.py` | （新增）Qwen2 模型定义 | 把 `Linear` 换成 `GPTQ*ParallelLinear` |
+| `nanovllm/layers/layernorm.py` | RMSNorm | 修 dtype，避免 fp32 传染 |
 
-`nanovllm/layers/gptq_linear.py`：
+策略要点：**复用 fp16 版本的 `weight_loader` 与 TP 切分逻辑，不重写引擎调度**。Qwen2 的 q/k/v/o 与 `gate/up` 都是分开的投影，因此不需要 `packed_modules_mapping` 融合（这与 Qwen3 不同）。
+
+---
+
+## 3. 适配实现
+
+### 3.1 参数与存储布局（`nanovllm/layers/gptq_linear.py`）
 
 ```python
 class GPTQColumnParallelLinear(nn.Module):
+    """GPTQ 4-bit 线性层 (TP=1 退化为整块加载)。"""
     def __init__(self, input_size, output_size, bias=False, group_size=128,
                  cache_dequant=None):
         super().__init__()
@@ -102,79 +135,185 @@ class GPTQColumnParallelLinear(nn.Module):
         self.group_size = group_size
         self.n_groups = input_size // group_size
         self.cache_dequant = _GPTQ_CACHE if cache_dequant is None else cache_dequant
-        self._w_cache = None
-        # 与 HF GPTQ 对齐的存储布局
+        self.mode = ("fused" if _FUSED else
+                     "cache" if self.cache_dequant else
+                     "torch" if _GPTQ_TORCH or not _HAS_DEQUANT else
+                     "stream")
+        self._w_cache = None                     # 反量化后的 fp16 权重缓存 (惰性构建)
+        # 存储布局与 HF GPTQ 一致:
+        #   qweight: (in//8, out)
+        #   qzeros : (n_groups, out//8)
+        #   scales : (n_groups, out)
         self.qweight = nn.Parameter(torch.zeros(input_size // 8, output_size, dtype=torch.int32), requires_grad=False)
         self.qzeros  = nn.Parameter(torch.zeros(self.n_groups, output_size // 8, dtype=torch.int32), requires_grad=False)
         self.scales  = nn.Parameter(torch.zeros(self.n_groups, output_size, dtype=torch.float16), requires_grad=False)
-        self.register_parameter("bias", None) if not bias else \
+        if bias:
             self.bias = nn.Parameter(torch.zeros(output_size, dtype=torch.float16), requires_grad=False)
-        self.zero_point_bias = 1      # 见 1.3：真实零点 = qzeros + 1
+        else:
+            self.register_parameter("bias", None)
+        self.zero_point_bias = 1                 # GPTQ v1: 真实零点 = qzeros + 1
 ```
 
-> 注意：本模型 `o_proj` 与 MLP **都没有 bias**（已核对 checkpoint 键名），所以 `attention_bias` 仅作用于 q/k/v。误给 `o_proj`/MLP 加 bias 会让 `weight_loader` 找不到对应张量而报错。
+> 本模型 `o_proj` 与 MLP **都没有 bias**（已核对 checkpoint 键名），`attention_bias` 仅作用于 q/k/v。误给 `o_proj`/MLP 加 bias 会让 `weight_loader` 找不到对应张量而报错。
 
-### 3.2 bit 解包
+### 3.2 bit 解包（torch 参考实现，也是 `torch`/`cache` 路径的底座）
 
 ```python
 def _unpack_qweight(qw):
-    # qw: (in//8, out) int32 -> (out, in) 码字
+    """qweight: (in//8, out) int32 -> (out, in) 码字"""
     shifts = torch.arange(0, 32, 4, dtype=torch.int32, device=qw.device)
-    w = (qw.unsqueeze(-1) >> shifts) & 0xF          # (in//8, out, 8)
-    return w.permute(1, 0, 2).reshape(qw.shape[1], -1)   # (out, in)
+    w = (qw.unsqueeze(-1) >> shifts) & 0xF            # (in//8, out, 8)
+    w = w.permute(1, 0, 2).reshape(qw.shape[1], -1)   # (out, in)
+    return w
 
 def _unpack_qzeros(qz):
-    # qz: (n_groups, out//8) int32 -> (out, n_groups)
+    """qzeros: (n_groups, out//8) int32 -> (out, n_groups)"""
     shifts = torch.arange(0, 32, 4, dtype=torch.int32, device=qz.device)
-    z = (qz.unsqueeze(-1) >> shifts) & 0xF           # (n_groups, out//8, 8)
-    z = z.reshape(qz.shape[0], -1).transpose(0, 1)    # (out, n_groups)
-    return z
+    z = (qz.unsqueeze(-1) >> shifts) & 0xF             # (n_groups, out//8, 8)
+    z = z.reshape(qz.shape[0], -1)                     # (n_groups, out)
+    return z.transpose(0, 1)                           # (out, n_groups)
 ```
 
-- `qweight` 解包：`unsqueeze(-1)>>shifts` 把每个 int32 拆成 8 个码字 → `(in//8, out, 8)`，再 `permute(1,0,2).reshape(out, in)` 得到 `(out, in)`。
-- `qzeros` 解包：拆成 `(n_groups, out//8, 8)` 后 `reshape`+`transpose` 得到 `(out, n_groups)`。
-
-### 3.3 反量化数学（含零点 + 分块）
+### 3.3 反量化数学（分块，含零点）
 
 ```python
 def _dequant_block(self, out_start, out_end):
+    """反量化 [out_start, out_end) 行, 返回 (rows, in_features) fp32。"""
     nb = out_end - out_start
-    qw = self.qweight[:, out_start:out_end]                       # (in//8, nb)
-    qz = self.qzeros[:, out_start // 8:(out_end + 7) // 8]         # (ngroups, ceil(nb/8))
-    sc = self.scales[:, out_start:out_end]                        # (ngroups, nb)
-    w = _unpack_qweight(qw)                                       # (nb, in)
-    z = _unpack_qzeros(qz).float().unsqueeze(-1)                  # (nb, ngroups, 1)
-    s = sc.transpose(0, 1).float().unsqueeze(-1)                  # (nb, ngroups, 1)
-    w = w.float().reshape(nb, self.n_groups, self.group_size)     # (nb, group, k)
-    w = (w - (z + self.zero_point_bias)) * s                      # ← 零点 + 1 在此生效
+    qw = self.qweight[:, out_start:out_end]                    # (in//8, rows)
+    qz = self.qzeros[:, out_start // 8:(out_end + 7) // 8]     # (ngroups, ceil(rows/8))
+    sc = self.scales[:, out_start:out_end]                     # (ngroups, rows)
+    w = _unpack_qweight(qw)                                    # (rows, in)
+    z = _unpack_qzeros(qz).float().unsqueeze(-1)               # (rows, ngroups, 1)
+    s = sc.transpose(0, 1).float().unsqueeze(-1)               # (rows, ngroups, 1)
+    w = w.float().reshape(nb, self.n_groups, self.group_size)  # (rows, group, k)
+    w = (w - (z + self.zero_point_bias)) * s                   # ← 零点 + 1 在此生效
     return w.reshape(nb, self.in_features)
 ```
 
-逐元素等价于：`W[o, g*gs + k] = (Q[o, g*gs+k] - (z_true[o,g])) * s[o,g]`，其中 `z_true = unpack(qzeros)[o,g] + 1`。
+> **精度约定**：反量化在 **fp32** 下完成再 `.half()` 给 GEMM，激活全程 fp16。这样中间累加不会在 fp16 下溢出，与 vLLM 行为对齐。
 
-> **精度细节**：反量化在 fp32 下做，再 `.half()` 给 GEMM；激活也保持 fp16。这样归一化/反量化的中间累加都在 fp32，避免 fp16 溢出，与 vLLM 行为对齐。
-
-### 3.4 分块 dequant 控制峰值显存（naive 模式）
-
-`out_features`（如 18944）一次解包会生成巨大临时张量。按 2048 行分块：
+### 3.4 四条路径的分派
 
 ```python
 def forward(self, x):
     xf = x.half()
-    if self.cache_dequant:
-        return xf @ self._cached_weight().t()
-    out_features = self.out_features
-    block = 2048 if out_features > 4096 else out_features
-    parts = []
-    for start in range(0, out_features, block):
-        end = min(start + block, out_features)
-        wb = self._dequant_block(start, end).half()      # (block, in) fp16
-        parts.append(xf @ wb.t())
-    out = torch.cat(parts, dim=-1)
+    if   self.mode == "fused":  out = self._forward_fused(xf)
+    elif self.mode == "cache":  out = xf @ self._cached_weight().t()
+    elif self.mode == "stream": out = self._forward_stream(xf)
+    else:                                     # torch: 分块 dequant + fp16 matmul
+        block = 2048 if self.out_features > 4096 else self.out_features
+        parts = []
+        for start in range(0, self.out_features, block):
+            end = min(start + block, self.out_features)
+            wb = self._dequant_block(start, end).half()      # (block, in) fp16
+            parts.append(xf @ wb.t())
+        out = torch.cat(parts, dim=-1)
     return out + self.bias if self.bias is not None else out
 ```
 
-### 3.5 模型层替换（`nanovllm/models/qwen2.py`）
+#### 路径 A：`torch`（朴素 on-the-fly，仅对照）
+
+按 2048 行分块 dequant（避免一次展开 18944 行生成巨大临时张量）后 matmul。
+**问题**：torch 张量运算解包会中间产生 `(in//8, out, 8)` 的 int32 大张量，访存量约为权重的 **30 倍**，完全 bandwidth-bound（见 §5）。
+
+#### 路径 B：`cache`（dequant 一次，缓存 fp16）
+
+```python
+def _cached_weight(self):
+    """首次调用时反量化整块权重并缓存 fp16, 随后释放 int4 打包权重。"""
+    if self._w_cache is None:
+        w = self._dequant_block(0, self.out_features).half()
+        for name in ("qweight", "qzeros", "scales"):
+            p = getattr(self, name, None)
+            if isinstance(p, nn.Parameter):
+                p.data = torch.empty(0, dtype=p.dtype, device=p.device)
+        self._w_cache = w
+    return self._w_cache
+```
+
+速度最快（89.1 tok/s）且数值精确，但**显存回到 14.2 GiB，放弃了量化的运行期收益** —— 定位是"速度/精度上界"参照，不是推荐用法。
+
+#### 路径 C：`stream`（**默认**：int4 常驻 + 复用 buffer + cuBLAS）
+
+```python
+def _forward_stream(self, xf):
+    """int4 常驻显存: Triton 把权重展开到复用的 fp16 暂存区, 再用 cuBLAS 做 GEMM。
+    展开结果与 cache 模式逐位一致 -> 数值行为与 cache/vLLM 对齐;
+    显存只多出一个最大层大小的 buffer (7B 约 136MB), 而不是整模型的 14GB。"""
+    W = dequantize_gptq(self.qweight, self.qzeros, self.scales,
+                        group_size=self.group_size,
+                        out=scratch_buffer(self.out_features * self.in_features, xf.device))
+    return xf @ W.t()
+```
+
+- **int4 权重常驻显存**（5.2 GiB），全程不展开成 fp16 权重张量。
+- 每次 forward 用 Triton 把权重解包到一块**全局复用**的 fp16 暂存区（按元素数向上取规格，一次分配、逐层覆写；同一 CUDA stream 顺序执行下安全），再交给 cuBLAS。
+- **数值 = cache 模式逐位相同**（喂给 cuBLAS 的是同一份 `(N, K)` fp16 权重），Part C 实测 64/64 匹配 vLLM。
+- 代价：比 cache 多一次 dequant 写 + cuBLAS 读（约 2× 权重带宽），吞吐 59.2 vs 89.1 tok/s。
+
+> **怎么选**：要**省显存 + 精确匹配 vLLM** → 默认 `stream`；要**极限吞吐且不在乎显存** → `cache`（14.2 GiB）。
+
+#### 路径 D：`fused`（Triton dequant-GEMM，对标 Marlin）
+
+```python
+def _forward_fused(self, xf):
+    """fused int4 dequant-GEMM (Triton): 不物化 fp16 权重。
+    支持任意前导维度 (引擎在 prefill 时可能传 (batch, seq, in))。"""
+    xc = xf.contiguous()
+    *lead, K = xc.shape
+    x2 = xc.reshape(-1, K)
+    M = x2.shape[0]
+    out = fused_gptq_linear(x2, self.qweight, self.qzeros, self.scales,
+                            M, self.out_features, K, self.group_size)
+    out = out.reshape(*lead, self.out_features)
+    return out + self.bias if self.bias is not None else out
+```
+
+kernel 内直接 `acc += tl.dot(x, W_dequant)`，fp16 权重完全不落显存。已知局限见 §7.2。
+
+### 3.5 Triton dequant kernel（`nanovllm/layers/gptq_dequant.py`，stream 的底座）
+
+```python
+@triton.jit
+def _dequant_gptq(qw_ptr, qz_ptr, sc_ptr, out_ptr,
+                  N, K, GS: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    """每个 program 负责 (BLOCK_N 个输出通道) x (BLOCK_K 个输入维) 的一块。
+    BLOCK_K 取 GS(128) 时整块同组, 零点/scale 只需 (BLOCK_N,) 两个向量。
+    输出布局 (N, K) —— 与 cache 模式完全一致, 因此 `x @ W.t()` 的 cuBLAS 调用逐位相同。"""
+    pid_n, pid_k = tl.program_id(0), tl.program_id(1)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    ...
+    r, sub = offs_k // 8, (offs_k % 8) * 4                     # qweight: 行 k//8, 位移 (k%8)*4
+    qw = tl.load(qw_ptr + r[None, :] * N + offs_n[:, None], ...).to(tl.uint32)
+    codes = (qw >> sub[None, :]) & 0xF
+    z = ((qz >> ((offs_n % 8) * 4)) & 0xF).to(tl.float32) + 1.0     # ← 零点 + 1
+    s = tl.load(sc_ptr + g * N + offs_n, ...).to(tl.float32)
+    W = ((codes.to(tl.float32) - z[:, None]) * s[:, None]).to(tl.float16)
+    tl.store(out_ptr + offs_n[:, None] * K + offs_k[None, :], W, ...)
+```
+
+关键设计：`BLOCK_K = group_size`，一块内同组，`z`/`s` 退化成两个 `(BLOCK_N,)` 向量，省共享内存；输出 `(N, K)` 与 cache 模式逐位一致。
+
+### 3.6 Triton fused dequant-GEMM（`nanovllm/layers/gptq_triton.py`）
+
+两个曾踩过并已修复的实质问题（写在文件头注释里）：
+
+1. **组号 `g` 必须由逐元素 `offs_k // GS` 计算**，不能写死 `k0 // GS` —— 旧写法只在 `BLOCK_K == GS` 时正确，导致历史上"BLOCK_K 从 128 改到 256/1024 误差不变"的实验是在 kernel 本身算错的前提下得到的，结论无效。
+2. **分块按 M 自适应**：decode（M≤8）用 `BM=16/BN=64` 提高 CTA 数量。旧配置 `BM=32/BN=64` 在 `q_proj` 上只有 56 个 CTA < 82 个 SM，三分之二硬件空转 —— 这是 fused 在 decode 上打不过 cuBLAS 的主要原因。
+
+```python
+def _pick_config(M, N):
+    if   M <= 8:   bm, bn, bk, ns = 16, 64, 32, 3
+    elif M <= 32:  bm, bn, bk, ns = 32, 64, 64, 3
+    elif M <= 64:  bm, bn, bk, ns = 64, 64, 32, 3
+    elif M <= 256: bm, bn, bk, ns = 128, 64, 32, 3
+    else:          bm, bn, bk, ns = 128, 128, 32, 2
+    ...
+```
+
+### 3.7 模型层替换（`nanovllm/models/qwen2.py`）
 
 把 `Linear` 换成 `GPTQ*ParallelLinear`，并把 `group_size` 从 config 透传：
 
@@ -189,19 +328,18 @@ self.up_proj   = GPTQColumnParallelLinear(hidden_size, intermediate_size, bias=F
 self.down_proj = GPTQRowParallelLinear(intermediate_size, hidden_size, bias=False, group_size=group_size)
 ```
 
-**MLP 激活函数必须正确**（曾写反的 bug）：
+**两个曾经写错、必须保持正确的细节**：
 
 ```python
+# 1) MLP 激活函数 (曾写反)
 def forward(self, x):
     gate = self.gate_proj(x)
     up   = self.up_proj(x)
     x = torch.nn.functional.silu(gate) * up      # 不是 gate * silu(up)！
     return self.down_proj(x)
-```
 
-**残差约定必须与原始 nano-vLLM 一致**（曾写错的 bug）：残差加法与 RMSNorm 融合，层内**不做最后一步加法**，交由下一层 `input_layernorm`（或最终 `norm`）完成：
-
-```python
+# 2) 残差约定必须与原始 nano-vLLM 一致：残差加法与 RMSNorm 融合，
+#    层内不做最后一步加法，交由下一层 input_layernorm（或最终 norm）完成。
 def forward(self, positions, hidden_states, residual):
     if residual is None:
         hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
@@ -216,9 +354,9 @@ def forward(self, positions, hidden_states, residual):
 hidden_states, _ = self.norm(hidden_states, residual)   # 最后一次 add-rms-norm
 ```
 
-### 3.6 loader / config 联动
+### 3.8 config / loader / model_runner 联动
 
-`config.py` 自动识别量化方法：
+**`config.py`** 自动识别量化方法：
 
 ```python
 qcfg = getattr(self.hf_config, "quantization_config", None)
@@ -227,21 +365,34 @@ if qcfg is not None and qcfg.get("quant_method") == "gptq":
     self.quantization = "gptq"
 ```
 
-`loader.py` 对 GPTQ 权重走 `weight_loader`（默认 `param.data.copy_`），safetensors 的 `qweight/qzeros/scales` 直接 `copy_` 进 `nn.Parameter`：
+**`loader.py`** 识别 GPTQ 后缀，剥离后缀再做 `packed_modules_mapping`，最后原样 `copy_` 进参数：
 
 ```python
 GPTQ_SUFFIXES = (".qweight", ".qzeros", ".scales", ".g_idx")
-# g_idx 在 group 对齐时不用，跳过；其余后缀原样映射参数名
+# g_idx 在 group 对齐时不需要, 跳过; 其余后缀保留在参数名上 (如 qkv_proj.qweight)
 ```
 
-`model_runner.py` 通过 `MODEL_REGISTRY` 把 `Qwen2ForCausalLM` 映射到本模型类即可，无需改引擎调度。
+**`model_runner.py`** 三处联动：
 
-### 3.7 RMSNorm 的 dtype fix
+```python
+MODEL_REGISTRY = {
+    "Qwen3ForCausalLM": "nanovllm.models.qwen3:Qwen3ForCausalLM",
+    "Qwen2ForCausalLM": "nanovllm.models.qwen2:Qwen2ForCausalLM",   # ← GPTQ 模型走这条
+}
+...
+# GPTQ 动态反量化不兼容 CUDA Graph，强制 eager
+self.enforce_eager = True if config.quantization == "gptq" else config.enforce_eager
+assert self.world_size == 1 or config.quantization is None, "GPTQ 仅支持单卡 (TP=1)"
+# 把 group_size 注入 hf_config，供模型构造时读取
+hf_config.group_size = qcfg.get("group_size", 128)
+```
+
+### 3.9 RMSNorm 的 dtype fix
 
 RMSNorm 权重若声明为 fp32，会把 fp16 激活提升为 fp32 并一路传染，破坏整图 fp16、拖慢且可能 OOM。改为与**输入 dtype**一致：
 
 ```python
-def rms_forward(self, x):
+def forward(self, x):
     dtype = x.dtype
     x = x.float()                                   # 归一化在 fp32 算（精度）
     var = x.pow(2).mean(-1, keepdim=True)
@@ -251,206 +402,236 @@ def rms_forward(self, x):
 
 ---
 
-## 4. 正确性验证（怎么证明没写错）
+# 第二部分：正确性验证
 
-“能 load、能 forward、不报错”≠“算对了”。量化 bug 的典型症状是**输出看似流畅但内容错乱**（系统性偏移）。两步验证：
+## 4. 怎么证明没写错
 
-### 4.1 数值不变量自检（零点）
+"能 load、能 forward、不报错" ≠ "算对了"。量化 bug 的典型症状是**输出看似流畅但内容错乱**（系统性偏移），必须靠数值不变量定位。
 
-对称量化下 `mean(unpack(Q)) ≈ 真实零点`。用这招可**不依赖任何外部实现**就定出 `zero_point_bias`：
-- 本模型 `qzeros=7`，`mean(Q)=7.998≈8` → 真实零点=8 → `zero_point_bias=1`。
-- 反证：若 `bias=0`，`mean(W)=+0.00746` 恰等于 `scales.mean()`，说明整体被平移一个 scale，方向完全吻合“少减了 1”。
+### 4.1 弱证据 vs 强证据
 
-### 4.2 与权威实现逐 token 对比（ground truth）
+**弱证据（只能当线索，不能当结论）**：对称量化下权重近似零均值，于是 `mean(unpack(Q)) ≈ 真实零点`。本模型 `qzeros=7`、`mean(Q)=7.998≈8`，据此推测真实零点 = 8。它有两个硬伤：
 
-以 vLLM `gptq_marlin` 为 ground truth（其 kernel 经过严格验证），**贪心解码逐 token 比对**：
+1. 依赖"权重零均值"这个分布假设；
+2. 只校验了一个常数，**完全不校验解包顺序、分组映射、`qzeros` 沿 N 的排列** —— 而这才是真正会写错的地方。
+
+实测它有多不可靠（`tests/verify_gptq.py` Part A3）：把码字分布人为推向一端后 `mean(码字)` 变成 10.1 / 12.2，而真实零点仍是 8 —— 按这个启发式会得出错误结论。
+
+**强证据（能定位具体 bug，且自带判别力）**：自造"黄金权重"做**无损往返 + 变异测试**。
+
+### 4.2 Part A：黄金往返 + 变异测试
 
 ```python
-# /tmp/correctness_test.py（节选）
-engine = LLMEngine(MODEL, tensor_parallel_size=1, max_num_batched_tokens=2048, max_num_seqs=4, max_model_len=1024)
-sp = SamplingParams(temperature=1e-3, max_tokens=48)   # temperature 极小 ≈ 贪心（SamplingParams 禁止纯贪心）
-outs = engine.generate(PROMPTS, sp, use_tqdm=False)
-# 与 vLLM 记录的 greedy token 序列逐位比对
+# 1) 构造能被 int4 精确表示的权重: 先随机码字, 再按约定反算出 W  ->  往返必须 max|err| = 0.0
+codes = torch.randint(0, 16, (N, K))
+W = ((codes - 8) * scale).half()
+qweight, qzeros, scales = pack(codes, ...)          # 按 GPTQ 布局打包
+assert (dequant(qweight, qzeros, scales) - W).abs().max() == 0      # 逐元素 bit-exact
+
+# 2) 变异测试: 人为注入错误, 断言测试必须失败 —— 否则这个测试本身没有判别力
 ```
 
-结果：**4 个 prompt × 48 token 全部 48/48 匹配**（naive / cache 两条路径，均走 cuBLAS）。
+| 注入的错误 | max\|err\| | 是否被抓住 |
+|---|---|---|
+| 零点少 +1（`z_true=qzeros`） | 0.53 | 是 |
+| `qweight` nibble 序反 | 7.97 | 是 |
+| `qweight` 轴/序理解错 | 7.97 | 是 |
+| 分组映射错（组号取反） | 3.90 | 是 |
+| `qzeros` 沿 N 解包序反 | 7.02 | 是 |
 
-> 补充（本次新增）：fused dequant-GEMM kernel 在**单层**与 naive 逐元素一致（合成多形状 max<0.05、真实 q_proj max 0.0），但全模型贪心解码会因 `tl.dot` 归约顺序 ≠ cuBLAS 而分歧（见 5.5.3），故 48/48 以 cuBLAS 路径为准。fused 适合作为融合反量化的技术验证与吞吐对照。
+每条都被抓住，说明这套测试**真的能区分对错**，而不像 `mean(码字)` 那样"怎么跑都像是对的"。
+
+Part A 还包含 **A4 有损量化**：对 `randn` 权重做真实对称 int4 量化，断言 `max|err| ≤ s_max/2`（理论界）；并对照 `zp_bias=0` 时误差均值 ≈ 一个 scale，与 §1.4 的"+1·scale 偏移"互相印证。
+
+### 4.3 Part B / B2：精度归因（fp64 真值）
+
+光看"fused vs cuBLAS 输出差 0.0"是不够的 —— fp16 **输出**落在同一可表示值上，并不代表 fp32 累加器逐位相同。Part B2 用 fp64 真值三方对比：
+
+Part B 扫真实权重层（`q_proj` / `gate_proj` / `down_proj`）× M ∈ {1, 4, 32, 256}，输出三列：`|fused − cuBLAS|`、`|fused − 真值|`、`|cuBLAS − 真值|`，以及不一致元素数。观察到的规律（复现见 §9）：
+
+| 形状 | fused vs cuBLAS（fp16 输出） | 相对 fp64 真值 |
+|---|---|---|
+| `M ≥ 32`（prefill 类） | 逐位一致，不一致元素 = 0 | 两者误差同量级 |
+| `M ≤ 4`（decode 类） | 极少数元素差 1~4 ulp | 两者误差同量级（有时 fused 更准） |
+
+结论：**fused 与 cuBLAS 只是归约顺序不同的两种等精度实现**，并非 fused 更差。具体是：
+
+- `M ≥ 32`（prefill 类形状）：与 cuBLAS 逐位一致（都走 tensor core，归约顺序一致）。
+- `M ≤ 4`（decode 类形状）：cuBLAS 切到 gemv 类实现，归约顺序与 `tl.dot` 不同，fp32 累加差约 1e-6 相对量，落到 fp16 输出上就是极少数元素差 1~4 ulp。
+
+单层无害，但 28 层残差 + softmax 会把它放大成贪心 token 分歧（见 §4.4）。
+
+### 4.4 Part C：端到端与 vLLM 逐 token 比对（ground truth）
+
+以 vLLM `gptq_marlin` 为 ground truth，**贪心解码逐 token 比对**（2 个 prompt × 32 tokens = 64）：
+
+```python
+# tests/verify_gptq.py 中每个 mode 起独立子进程, temperature=1e-9 近似贪心
+llm = LLM(MODEL, tensor_parallel_size=1, max_num_batched_tokens=2048,
+          max_num_seqs=2, max_model_len=1024)
+outs = llm.generate(PROMPTS_C, SamplingParams(temperature=1e-9, max_tokens=32), use_tqdm=False)
+```
+
+| 路径 | 匹配 / 总数 | 结论 |
+|---|---|---|
+| stream | 64 / 64 | 逐 token 一致 |
+| cache | 64 / 64 | 逐 token 一致 |
+| torch | 64 / 64 | 逐 token 一致 |
+| **fused** | **0 / 64** | **首个 token 即分歧** |
+
+三条走 cuBLAS 的路径都精确对齐；fused 因 §4.3 的 decode 归约差异在深残差下被放大，**0/64** —— 这就是它不能作为默认路径的原因。
 
 ---
 
-## 5. 性能分析与优化
+# 第三部分：性能分析
 
-### 5.1 naive 模式的真实瓶颈：显存带宽
+## 5. 瓶颈：为什么朴素 dequant 只有 2 tok/s（吞吐 8.5）
 
-每层 MLP 含 3 个 `(18944 × 3584)` 投影，注意力含 2 个 `(3584 × 3584)` 等。单次 forward 需反量化约 **6.5B 参数**（7B × ≈0.93，含 lm_head）。每个元素反量化要 shift/mask/sub/mul 多次访存，单 forward 的权重访存量 ≈ 数百 GB，在 3090（~936 GB/s）上 ≈ **0.5 s/forward**，即 ≈ **1.9 tok/s** 的惨烈解码速度。这是典型的 **memory-bound**，不是算力不够。
+每层 MLP 含 3 个 `(18944 × 3584)` 投影，注意力含 2 个 `(3584 × 3584)` 等。单次 forward 需反量化约 **6.5B 参数**（7B × ≈0.93，含 lm_head）。
 
-naive 模式的优点：权重常驻 int4（≈3.5GB），显存最省。
+`torch` 路径每个元素要 shift/mask/sub/mul 多次访存，还会中间物化 `(in//8, out, 8)` 的 int32 张量，**访存量约为权重的 30 倍**：单 forward 权重访存量达数百 GB，在 3090（~936 GB/s）上约 0.5 s/forward，即 **约 2 tok/s**（实测 2.2）。
 
-### 5.2 优化：权重缓存（dequant 一次，缓存 fp16）
+这是典型的 **memory-bound**，不是算力不够。它的唯一优点是权重常驻 int4，显存最省（5.2 GiB）。
 
-```python
-def _cached_weight(self):
-    if self._w_cache is None:
-        w = self._dequant_block(0, self.out_features).half()   # 只解包一次
-        for name in ("qweight", "qzeros", "scales"):            # 解包后释放 int4 权重
-            getattr(self, name).data = torch.empty(0, ...)
-        self._w_cache = w
-    return self._w_cache
-```
+## 6. 四条路径实测
 
-开关注环境变量 `NANOVLLM_GPTQ_CACHE=1`。收益：**TTFT 510ms → 31ms（17×），并发吞吐 7.2 → 69.4 tok/s（9.6×）**。代价：显存回到 fp16 的 ≈14GB（量化只省了“加载/磁盘”，运行期不再省）。
+测试条件：RTX 3090 24GB，4 并发（bench.py 的 4 条 prompt），`max_tokens=128`，`bench.py --engine all`。
 
-### 5.3 与 vLLM Marlin 的差距（核心 insight）
+| 路径 | TTFT (ms) | Decode 单请求 (tok/s) | 4 并发吞吐 (tok/s) | 权重显存 (GiB) | 相对 vLLM 吞吐 |
+|---|---|---|---|---|---|
+| torch（朴素 on-the-fly） | 456.2 | 2.2 | 8.5 | 5.20 | 0.02× |
+| **stream（默认）** | 51.3 | 18.8 | **59.2** | **5.20** | 0.17× |
+| fused（Triton dequant-GEMM） | — | — | **78.1** | 5.20 | 0.23× |
+| cache（fp16 缓存，仅对照） | 28.7 | 33.0 | **89.1** | 14.20 | 0.26× |
+| *vLLM gptq_marlin（参考）* | 8.9 | 106.0 | 343.6 | — | 1.00× |
 
-| engine | TTFT(ms) | Decode(t/s) | 并发吞吐(t/s) | 相对 vLLM 吞吐 |
-|---|---|---|---|---|
-| nano-vLLM 朴素 dequant | 456.1 | 2.2 | 8.5 | 0.03× |
-| nano-vLLM 权重缓存 fp16 | 28.6 | 33.0 | 87.7 | 0.26× |
-| **nano-vLLM fused dequant-GEMM (Triton)** | 36.2 | 27.0 | 77.9 | 0.23× |
-| vLLM gptq_marlin | 9.3 | 104.9 | 337.6 | 1.00× |
+> fused 的 TTFT / 单请求 decode 未单独记录（该路径不参与默认部署），仅记录并发吞吐。
 
-> 测量口径见 5.4；fused 内核为本次新增实验（详见 5.5），其吞吐与 cache 同量级、略低。
+**逐条解读**：
 
-即使缓存到 fp16，我们仍只有 vLLM 的 **~26% 吞吐**。原因：
-- **Marlin 把反量化融进 GEMM kernel**，不把 fp16 权重物化到显存（省一次 HBM 往返），这正是 weight-only 量化的“正统”加速路径。
-- vLLM 还叠加了 CUDA Graph、FlashAttention、更细的调度与 prefix cache。
-- 我们只是 python/torch 朴素实现：每次 matmul 都要先把 fp16 权重从显存读进来。
+- **cache vs torch**：TTFT 456.2 → 28.7 ms（**15.9×**），并发吞吐 8.5 → 89.1 tok/s（**10.5×**）。代价是显存回到 fp16 的 14.2 GiB。
+- **stream vs cache**：吞吐 59.2 vs 89.1（多付一次 dequant 写 + cuBLAS 读，约 2× 权重带宽），换回显存 **5.20 vs 14.20 GiB（2.7× 降幅）**，且数值逐位相同。
+- **fused vs stream**：吞吐 78.1 vs 59.2，显存同为 5.20 GiB（连暂存 buffer 都省了），但**数值在 decode 形状有 1~4 ulp 差异 → 端到端 0/64**。
+- **量化到底省不省显存？** 省 —— 由默认 `stream` 路径兑现（5.20 GiB）。`cache` 的 14.20 GiB 只是"精度/速度上界"对照，**不是**默认路径。
 
-> 这个差距本身就是最好的面试素材：**量化推理的加速不来自“权重变小”，而来自“反量化不再显式落盘”——kernel 内融合才是关键**。
+## 7. 与 vLLM Marlin 的差距与根因
 
----
+即使有 fused，我们仍只有 vLLM 的 **~23% 吞吐**。原因是两道坎：
 
-### 5.5 进一步：fused dequant-GEMM kernel（Triton 实战，本次新增）
+### 7.1 反量化要融进 GEMM kernel（我们做了一半）
 
-“下一步”里说的 Triton fused kernel 我们真的写了一个（`nanovllm/layers/gptq_triton.py` + `GPTQ*Linear._forward_fused`，开关注 `NANOVLLM_GPTQ_FUSED=1`）。它要把 §5.3 说的“Marlin 加速本质”在工程上落地：**int4 权重常驻显存，在 kernel 内解包 + 反量化成 fp16 后才进 `tl.dot`，fp16 权重从不物化到 HBM**。
+Marlin 把反量化融进 GEMM，**不把 fp16 权重物化到显存**（省一次 HBM 往返），这正是 weight-only 量化的"正统"加速路径。我们的 `fused` 做到了这一点（78.1 tok/s，显存 5.2 GiB）。
 
-#### 5.5.1 kernel 写法（关键 20 行）
+### 7.2 但融合还不够，还得有同款归约顺序（我们没做）
 
-```python
-# grid=(cdiv(M,32), cdiv(N,64)), BLOCK_M=32, BLOCK_N=64, BLOCK_K=128 (= group_size)
-for kk in range(tl.cdiv(K, BLOCK_K)):          # 每个 K-block 恰好是一个 dequant group
-    k0 = kk * BLOCK_K
-    offs_k = k0 + tl.arange(0, BLOCK_K)        # (BLOCK_K,) 输入维绝对索引
-    x = tl.load(x_ptr + (offs_m[:,None]*K + offs_k[None,:]), ...) .to(tl.float16)
-    # 零点: 沿 N 每 8 输出打包一个 int32, 解包 + 1
-    g = k0 // GS
-    nz = pid_n*BLOCK_N + tl.arange(0, BLOCK_N)
-    qz = tl.load(qz_ptr + (g*(N//8) + nz//8), ...).to(tl.uint32)
-    z = ((qz >> ((nz % 8)*4)) & 0xF).to(tl.float16) + 1.0
-    s = tl.load(sc_ptr + (g*N + offs_n), ...).to(tl.float16)
-    # 权重码字: 输入行 k 对应 qweight 行 k//8, 位移 (k%8)*4 —— 指针算术逐元素解包
-    r = offs_k // 8
-    sub = offs_k % 8
-    qw = tl.load(qw_ptr + (r[:,None]*N + offs_n[None,:]), ...).to(tl.uint32)
-    w_codes = (qw >> (sub[:,None]*4)) & 0xF
-    W = ((w_codes.to(tl.float32) - z[None,:].to(tl.float32)) * s[None,:].to(tl.float32)).to(tl.float16)
-    acc += tl.dot(x, W)                          # K=BLOCK_K>=16, fp32 累加
-out = acc.to(tl.float16)
-```
+`tl.dot` 的归约顺序 ≠ cuBLAS。Marlin 专门处理了这一点，而我们直接用通用 `tl.dot`，导致 decode 形状 1~4 ulp 差异，深残差放大后贪心分歧（0/64）。**这就是 naive Triton 融合追不平 Marlin 的根因**。
 
-反量化在 **fp32** 下做、仅喂 `tl.dot` 前 `.half()`——否则 fp16 下 `(code-z)*s` 的舍入会随 K 增大累积（K=18944 时 max diff 0.06）。
+### 7.3 调度栈差距
 
-#### 5.5.2 踩坑全记录（这些坑都真实踩过，单测/真实权重验证）
+vLLM 还叠加了 CUDA Graph、FlashAttention、更细的调度与 prefix cache；我们是 python/torch 朴素实现，且 GPTQ 动态反量化目前**强制 eager**（`model_runner.py`），拿不到 CUDA Graph 的收益。
 
-1. **`tl.cat` 已废弃**：新版 Triton 没有 `tl.cat`（历史上还会“always may reorder”元素），不能用来拼 `(BN,8)`+`(BN,8)→(BN,16)`。
-2. **`tl.reshape` 不是行主序重解释**：想从 `(BK//8, BN, 8)` 重排成 `(BK, BN)`，`reshape` 会把 `r*8+sub` 错位（实测 max 7/15），整张权重错位。→ 改用**指针算术逐元素解包**：`r=k//8, sub=k%8, qw[pid_k*r + n] >> (sub*4) & 0xF`，一步得到 `(BK, BN)`。经 `debug_w` 验证与 torch 参考逐元素 **max 0.0**。
-3. **uint32 逻辑右移**：真实 int4 权重高位可能是 1、被存成“负 int32”，有符号 `>>` 会符号扩展，与 torch 的 `&0xF` 不一致 → 一律先 `.to(tl.uint32)`。
-4. **`tl.dot` 要求 `K>=16`**：单组 8 行不够，必须按 2 组（16 行）组 K-block。
-5. **`tl.dot` 共享内存**：`BLOCK_N=128` 时 req 180KB > 硬件 99KB，改 `BLOCK_N=64`。
-6. **3D 输入**：引擎 prefill 时线性层可能收到 `(B,S,in)`，`_forward_fused` 里 `M,K = xc.shape` 会崩 → 改为 `*,K = xc.shape; reshape(-1,K)`，支持任意前导维。
-7. **残差流混沌（最深刻的一课）**：kernel 单层与 naive 逐元素一致（真实 q_proj max 0.0），但 `tl.dot` 的 K 维归约顺序与 cuBLAS 不同，单层 ~1~2 ulp 误差；在 28 层残差流里逐层放大（注意力 softmax 对微小 logit 差极敏感），贪心解码会与 vLLM **彻底分歧**（输出塌成 “the the the” 这类高频词循环）。见 5.5.3。
+> 这个差距本身就是最好的面试素材：**量化推理的加速不来自"权重变小"，而来自"反量化不再显式落盘"——kernel 内融合 + 与 cuBLAS 同款归约顺序才是关键**。
 
-#### 5.5.3 效果与诚实结论
-
-- **内存/带宽收益是真有的**：int4 权重不物化 fp16，省一次 HBM 往返，正是 Marlin 的思路。
-- **吞吐并未追平**：本硬件（3090 24GB）上 7B 模型的瓶颈是**算力 + 注意力**，不是权重带宽，所以 fused（77.9 tok/s）反而比 cache（87.7 tok/s，cuBLAS 高度优化）略慢；二者都只有 vLLM（337.6，Marlin+CUDA Graph+FlashAttn）的 ~1/4。
-- **精度不能追平（关键）**：`tl.dot` 的归约顺序 ≠ cuBLAS，单层 ~2 ulp 在深残差模型里放大成贪心 token 分歧。**精确贪心匹配 vLLM 必须用 cache 模式（cuBLAS，已验证 48/48）**。
-- **所以 fused kernel 的定位是“教学级 Marlin 实现 + 技术验证”**：它证明了融合反量化的写法与内存收益，也用血泪教训说明了为什么 Marlin 难写——**通用 `tl.dot` 的归约精度不够喂深残差模型**。要真正追平，得写与 cuBLAS 同款归约的自定义 TensorCore kernel（Marlin 的做法），并接入 CUDA Graph / FlashAttention，那是另一个量级的工作。
-
-> 这反而是更强的面试素材：**不仅做出来了，还定量测出了“为什么 naive Triton 融合并不能追平 Marlin”**——精度（归约顺序）+ 调度（CUDA Graph）两道坎，而不是“权重变小”本身。
-
-### 5.4 测量口径（诚实性）
+## 8. 测量口径（诚实性）
 
 - vLLM 离线 API 的 `RequestOutput.metrics` 在本环境为 `None`，TTFT 用 `max_tokens=1` 端到端计时（含 1 个 decode step + 调度开销），**略微高估 vLLM 的 TTFT**，即对比偏保守。
 - nano-vLLM 的 TTFT = 首个 prefill step 完成耗时；Decode 从首 token 后开始计时。
+- **权重显存单独统计**（`bench.py::_weights_gib`）：KV cache 会按剩余显存自动分配，所以"进程显存峰值"看不出量化收益，必须单算 `parameters + buffers + _w_cache`。
+- 各引擎在**独立子进程**中运行，避免 CUDA 上下文/显存互相干扰。
 
 ---
 
-## 6. 复现命令
+# 第四部分：复现
+
+## 9. 复现命令
 
 ```bash
 # 环境
 export CUDA_VISIBLE_DEVICES=1
 PY=/nas_data/WR/conda/wr-vllm/bin/python
 
-# 正确性：nano-vLLM vs vLLM(gptq_marlin) 贪心逐 token 对比
-$PY /tmp/correctness_test.py
+# ---- 正确性：四层验证 (tests/verify_gptq.py) ----
+$PY tests/verify_gptq.py --part A     # 黄金往返 + 变异测试（强证据）
+$PY tests/verify_gptq.py --part B     # 真实权重单层：fused vs cuBLAS，多形状
+$PY tests/verify_gptq.py --part B2    # 精度归因：fused / cuBLAS / fp64 真值三方对比
+$PY tests/verify_gptq.py --part C     # 端到端贪心 token：四条路径 vs vLLM（2×32=64）
+$PY tests/verify_gptq.py --part AB2C  # 全部
 
-# 性能：naive / 缓存 / fused / vLLM 四引擎对比（独立子进程，避免显存干扰）
-$PY bench.py --engine all --max_tokens 128
+# ---- 性能：单层微基准（含 stream 与 cache 逐位一致性断言） ----
+$PY tests/bench_layer.py
 
-# 仅跑某一引擎（cache 与 fused 用独立开关）
-$PY bench.py --engine nanovllm --max_tokens 128          # 朴素 on-the-fly
-$PY bench.py --engine nanovllm-cache --max_tokens 128    # 权重缓存 fp16（cuBLAS，精确）
-$PY bench.py --engine nanovllm-fused --max_tokens 128    # Triton fused dequant-GEMM
+# ---- 性能：端到端（独立子进程，避免显存干扰） ----
+$PY bench.py --engine all --max_tokens 128                  # 四条路径 + vLLM 汇总对比
+$PY bench.py --engine nanovllm --max_tokens 128             # 默认 stream
+$PY bench.py --engine nanovllm-cache --max_tokens 128       # NANOVLLM_GPTQ_CACHE=1
+$PY bench.py --engine nanovllm-fused --max_tokens 128       # NANOVLLM_GPTQ_FUSED=1
+$PY bench.py --engine nanovllm-torch --max_tokens 128       # NANOVLLM_GPTQ_TORCH=1
+$PY bench.py --engine vllm --max_tokens 128                 # 参考基准
+
+# ---- 冒烟 ----
+$PY test_gen.py
 ```
 
 ---
 
-# 第二部分：Infra 简历项目（可直接用）
+# 第五部分：Infra 简历项目（可直接用）
 
-## 项目标题（一）
+## 项目标题
 
 **LLM 推理引擎量化（GPTQ-Int4）支持与性能优化** — nano-vLLM（自研极简推理引擎，~2k 行）
 
-## 项目描述（简历正文，约 60 字）
+## 项目描述（约 60 字）
 
-在自研极简推理引擎中实现 GPTQ-4bit 权重量化推理，打通 bit 解包→零点对齐→融合反量化的完整链路；进一步用 Triton 手写了 fused dequant-GEMM kernel（int4 权重不物化 fp16、kernel 内融合反量化）；通过数值不变量 + 权威引擎逐 token 比对验证正确性，并定位带宽瓶颈与 Triton 归约精度瓶颈，吞吐从 7 tok/s 优化到 69 tok/s（融合 kernel 77.9 tok/s），定位出与 Marlin 的真实差距。
+在自研极简推理引擎中实现 GPTQ-4bit 权重量化推理，打通 bit 解包→零点对齐→反量化→GEMM 的完整链路；设计"黄金往返 + 变异测试"的强证据验证方案替代弱启发式；最终落地 `stream` 默认路径（int4 常驻显存 + 复用 buffer + cuBLAS），在保持量化显存收益（5.2 GiB vs fp16 14.2 GiB）的同时做到与 vLLM 逐 token 一致，吞吐 8.5 → 59.2 tok/s。
 
 ## 职责与成果（bullet，可直接贴）
 
-- 在 ~2k 行的极简推理引擎中落地 GPTQ-Int4 支持：实现 int32 位解包、零点约定对齐（`z_true = qzeros + 1`）、group-wise 反量化与分块 matmul，复用原有 TP 切分与权重加载路径，无需改动引擎调度。
-- 设计正确性验证方案：用“对称量化 `mean(码字) ≈ 真实零点`”数值不变量定位零点偏移 bug，并以 vLLM `gptq_marlin` 为 ground truth 做贪心逐 token 比对，4 个 prompt × 48 token **全匹配**。
-- 定位 naive 反量化的**显存带宽瓶颈**（单 forward 反量化 6.5B 参数 ≈ 0.5s，仅 1.9 tok/s），实现“反量化一次缓存 fp16”优化，TTFT 17×、并发吞吐 9.6×（7.2 → 69.4 tok/s）。
-- 进一步用 **Triton 手搓 fused dequant-GEMM kernel**：int4 权重常驻显存、kernel 内逐元素解包（`r=k//8, sub=k%8` 指针算术）+ fp32 反量化后直接进 `tl.dot`，fp16 权重不物化 HBM；踩过 `tl.cat` 废弃、`tl.reshape` 错位、uint32 符号扩展、`tl.dot K>=16`、共享内存与 3D 输入等坑，单层与 cuBLAS 逐元素一致（真实 q_proj max 0.0）。
-- 通过系统剖析指出与 vLLM 约 4× 吞吐差距的根因：Marlin 将反量化**融进 GEMM kernel**（不物化 fp16 权重），量化收益来自“免显存往返”而非“权重变小”；并定量测出 fused kernel 仍只有 vLLM ~1/4 吞吐、且 `tl.dot` 归约顺序 ≠ cuBLAS 会在深残差模型放大成贪心 token 分歧——精确定位了“为什么 naive Triton 融合并不能追平 Marlin”。
+- 在 ~2k 行的极简推理引擎中落地 GPTQ-Int4 支持：实现 int32 位解包、零点约定对齐（`z_true = qzeros + 1`）、group-wise 反量化与分块 matmul，复用原有 TP 切分与权重加载路径，**无需改动引擎调度**；同时给出四条可切换执行路径（stream / cache / fused / torch）。
+- 设计**强证据的**正确性验证：自造"能被 int4 精确表示"的黄金权重做无损往返（max|err|=0），再用变异测试（注入零点 / 轴序 / 分组 / 解包序等 5 类错误）验证测试**有判别力**（每条错误都被抓住，而 `mean(码字)≈零点` 这类弱启发式会漏判）；并以 vLLM `gptq_marlin` 为 ground truth 做贪心逐 token 比对，**64/64 全匹配**。
+- 定位朴素反量化的**显存带宽瓶颈**（torch 路径访存量约权重的 30 倍，单 forward ~0.5s，仅 2 tok/s），实现"反量化一次缓存 fp16"优化，TTFT **15.9×**、并发吞吐 **10.5×**（8.5 → 89.1 tok/s）。
+- 用 **fp64 真值归因** 做精度校验：确认 deep 残差模型里任何反量化数值偏差都会被注意力 softmax 逐层放大成贪心 token 分歧 —— 因此默认路径必须保证与 vLLM 数值逐位对齐。
+- 落地 `stream` 默认路径（Triton 快速解包到复用 buffer + cuBLAS）：**量化运行期显存收益真正落到默认路径**（5.2 GiB vs fp16 14.2 GiB，2.7× 降幅），与 vLLM 逐 token 一致，吞吐 8.5（朴素）→ 59.2 tok/s。
+- 实现 Triton **fused dequant-GEMM**（fp16 权重不物化，吞吐 78.1 tok/s）并定位其与 Marlin 的本质差距：修复组号计算与 decode 分块占用率两个 bug 后，确认剩余差异来自 `tl.dot` 与 cuBLAS 的归约顺序不同（decode 形状 1~4 ulp，端到端 0/64）—— 明确了下一步要写同款归约顺序的自定义 TensorCore kernel。
 
-## 量化指标（放简历“成绩”栏）
+## 量化指标（放简历"成绩"栏）
 
-| 指标 | 优化前 | 优化后（cache） | fused kernel |
-|---|---|---|---|
-| 解码吞吐（单请求） | 1.9 tok/s | 33.0 tok/s | 27.0 tok/s |
-| 4 并发总吞吐 | 8.5 tok/s | 87.7 tok/s | 77.9 tok/s |
-| 首 token 时延 TTFT | 456 ms | 28.6 ms | 36.2 ms |
-| 与 vLLM 吞吐比 | 0.03× | 0.26× | 0.23× |
-| 权重显存 | 3.5 GB (int4) | 14 GB (fp16) | 3.5 GB (int4) |
+| 指标 | torch(朴素) | stream(默认) | fused | cache(对照) | vLLM |
+|---|---|---|---|---|---|
+| 4 并发总吞吐 (tok/s) | 8.5 | 59.2 | 78.1 | 89.1 | 343.6 |
+| 首 token 时延 TTFT (ms) | 456.2 | 51.3 | — | 28.7 | 8.9 |
+| 与 vLLM 吞吐比 | 0.02× | 0.17× | 0.23× | 0.26× | 1.00× |
+| 权重显存 (GiB) | 5.20 | **5.20** | 5.20 | 14.20 | — |
+| 端到端 token 匹配 vLLM | 64/64 | 64/64 | **0/64** | 64/64 | — |
+
+> stream = int4 常驻 + 复用 buffer + cuBLAS；fused = kernel 内融合反量化（不物化 fp16，但有归约顺序差异）；cache = 反量化一次缓存 fp16（容量↔带宽 trade-off，仅对照）。
 
 ## 技术栈 / 关键词
 
-PyTorch、GPTQ、weight-only quantization、int4 位解包、group-wise dequant、CUDA 显存带宽分析、vLLM、Marlin GEMM kernel、RMSNorm fp32 归一化、Tensor Parallel、推理引擎。
+PyTorch、Triton、GPTQ、weight-only quantization、int4 位解包、group-wise dequant、fused dequant-GEMM、CUDA 显存带宽分析、vLLM、Marlin GEMM kernel、RMSNorm fp32 归一化、Tensor Parallel、推理引擎。
 
-## 面试 talk track（STAR 展开）
+## 面试 talk track（STAR）
 
 **S（情境）**：业务要在单张 24GB 消费卡上跑 7B 模型，fp16 权重 14GB 顶满显存；现成引擎（vLLM）黑盒、不利于学习量化内核细节，于是基于 nano-vLLM 自研支持。
 
-**T（任务）**：在不破坏 fp16 路径、不重写引擎调度的前提下，让引擎能正确且不太慢地跑 GPTQ-Int4 模型。
+**T（任务）**：在不破坏 fp16 路径、不重写引擎调度的前提下，让引擎能正确且不太慢地跑 GPTQ-Int4 模型，并且**默认路径就要真正享受到量化的显存收益**。
 
 **A（行动 / 技术亮点）**：
-1. 先把 GPTQ 格式吃透：码字打包方向、`(in//8, out)` / `(ngroups, out//8)` 形状、`z_true = qzeros + 1` 的零点约定。
-2. 用数值不变量（`mean(Q) ≈ z_true`）发现并修复零点偏移——这是“能跑但输出错乱”的静默 bug，肉眼看不出来。
+1. 先吃透 GPTQ 格式：码字打包方向、`(in//8, out)` / `(ngroups, out//8)` 形状、`z_true = qzeros + 1` 的零点约定。
+2. 用**黄金往返 + 变异测试**发现并修复零点偏移 —— `mean(码字)≈零点` 这种弱启发式会漏判，只有"注入错误还能抓住"的测试才可信。
 3. 分块反量化 + fp32 中间累加 + fp16 输出，对齐 vLLM 的数值行为，避免 fp16 溢出。
-4. 正确性用**双保险**验证：数值不变量自检 + vLLM ground truth 逐 token 比对。
-5. 性能剖析定位 bandwidth-bound，做 dequant-cache 优化；并进一步剖析出与 Marlin 的差距根因。
+4. 正确性用**四层验证**：黄金往返 / 变异测试（强证据）+ 单层 fused-vs-cuBLAS + fp64 真值归因 + vLLM ground truth 逐 token 比对（64/64）。
+5. 性能剖析定位 bandwidth-bound，先后做 dequant-cache 与 stream（int4 常驻 + 复用 buffer）两条优化路径。
+6. 写 Triton fused dequant-GEMM 对标 Marlin，并用 fp64 归因定位到"归约顺序"这个真正的根因。
 
-**R（结果）**：正确性 48/48 全匹配；吞吐 7→69 tok/s；并形成对“量化加速本质 = kernel 内融合反量化”的系统性认知。
+**R（结果）**：正确性 64/64 全匹配；吞吐 8.5 → 59.2 tok/s（fused 78.1）；权重显存 14.2 → 5.2 GiB（2.7× 降幅）；并形成对"量化加速本质 = kernel 内融合反量化 + 同款归约顺序"的系统性认知。
 
-## 延伸思考（加分项，面试官最爱追问）
+## 延伸思考（面试官最爱追问）
 
 - **为什么不一上来就写 CUDA kernel？** 先用 torch 朴素实现 + 正确性与基线对齐，确认算法正确再谈性能；过早优化会淹没 bug。
-- **下一步怎么做才能追平 vLLM？** Triton fused dequant-GEMM 已经做过了（见 5.5，吞吐 77.9 vs vLLM 337.6），但它证明**光有“不物化 fp16 权重”还不够**，还剩两道坎：① **归约精度**——要写与 cuBLAS 同款归约顺序的自定义 TensorCore kernel（Marlin 的做法），而非直接用通用 `tl.dot`；② **调度栈**——接入 CUDA Graph、FlashAttention 与 paged KV cache。两者都补齐才有望从 0.23× 追到 1×。
-- **为什么权重缓存反而显存变大？** 量化只省“磁盘/加载”，naive 运行时仍常驻 int4 省显存；cache 模式用 fp16 换带宽，是容量↔带宽的 trade-off。
-- **GPTQ-v2 / AWQ / GGUF 怎么扩展？** 零点是 `qzeros` 本身（不需 +1）即 GPTQ-v2；AWQ 是 `W = (Q) * s + z` 的反向缩放 + act-order；GGUF 是另一套打包（需转 `q8_0` 等）。架构上只需新增 `unpack`/`dequant` 与 loader 映射。
+- **下一步怎么追平 vLLM？** 两道坎：① **归约精度** —— 写与 cuBLAS 同款归约顺序的自定义 TensorCore kernel（Marlin 的做法），而非直接用通用 `tl.dot`；② **调度栈** —— 接入 CUDA Graph（当前 GPTQ 因动态反量化强制 eager）、FlashAttention 与 paged KV cache。两者都补齐才有望从 0.23× 追到 1×。
+- **为什么不直接用 fused 当默认？** 它在 decode 形状（M≤4）与 cuBLAS 有 1~4 ulp 差异，28 层残差里被 softmax 放大成贪心 token 分歧（实测 0/64）。它证明了融合反量化的写法与内存收益，但因归约顺序问题与深残差模型不兼容，故默认走 `stream`。
+- **cache 模式显存为什么反而变大？** 它是用 fp16 容量换带宽的 trade-off，只作"速度/精度上界"对照；真正的量化收益由默认 `stream` 路径（int4 常驻）体现（5.2 vs 14.2 GiB）。
+- **GPTQ-v2 / AWQ / GGUF 怎么扩展？** 零点是 `qzeros` 本身（不需 +1）即 GPTQ-v2；AWQ 是 `W = Q * s + z` 的反向缩放 + act-order；GGUF 是另一套打包（需转 `q8_0` 等）。架构上只需新增 `unpack`/`dequant` 与 loader 映射 —— 本实现已按"四条路径 + 可插拔 dequant"组织。
 
 ---
 
@@ -458,12 +639,15 @@ PyTorch、GPTQ、weight-only quantization、int4 位解包、group-wise dequant�
 
 | 文件 | 作用 |
 |---|---|
-| `nanovllm/layers/gptq_linear.py` | GPTQ 线性层：bit 解包、零点对齐、分块/缓存反量化、fused 分支 |
-| `nanovllm/models/qwen2.py` | Qwen2 模型定义，GPTQ 层替换、MLP/残差正确性 |
-| `nanovllm/layers/layernorm.py` | RMSNorm，fp32 归一化 + 输出还原 fp16 |
+| `nanovllm/layers/gptq_linear.py` | GPTQ 线性层：参数布局、bit 解包、零点对齐、四条路径分派与缓存逻辑 |
+| `nanovllm/layers/gptq_dequant.py` | Triton dequant kernel + 全局复用 scratch buffer（stream 路径底座） |
+| `nanovllm/layers/gptq_triton.py` | Triton fused dequant-GEMM kernel + 自适应分块 + 踩坑注释 |
+| `nanovllm/models/qwen2.py` | Qwen2 模型定义：GPTQ 层替换、MLP 激活与残差约定 |
+| `nanovllm/layers/layernorm.py` | RMSNorm：fp32 归一化 + 输出还原 fp16 |
 | `nanovllm/config.py` | 从 `quantization_config` 自动识别 `gptq` |
-| `nanovllm/utils/loader.py` | safetensors → `nn.Parameter`（`qweight/qzeros/scales` 直拷） |
-| `nanovllm/engine/model_runner.py` | `MODEL_REGISTRY` 分派 `Qwen2ForCausalLM` |
-| `nanovllm/layers/gptq_triton.py` | Triton fused dequant-GEMM kernel（int4 不物化 fp16）+ 踩坑注释（本次新增） |
-| `bench.py` | 四引擎（naive / cache / fused / vLLM）对比基准 |
-| `/tmp/correctness_test.py` | 逐 token 正确性验证（cuBLAS 路径 48/48） |
+| `nanovllm/utils/loader.py` | safetensors → `nn.Parameter`（GPTQ 后缀剥离 + packed 映射） |
+| `nanovllm/engine/model_runner.py` | `MODEL_REGISTRY` 分派、GPTQ 强制 eager、`group_size` 注入 |
+| `tests/verify_gptq.py` | 四层正确性验证：A 黄金往返/变异、B 单层对比、B2 fp64 归因、C 端到端 vs vLLM |
+| `tests/bench_layer.py` | 单层微基准：cache/stream/fused/torch 耗时与等效带宽 + stream==cache 逐位断言 |
+| `bench.py` | 端到端基准：四条路径 + vLLM，独立子进程隔离 |
+| `test_gen.py` | 冒烟测试 |

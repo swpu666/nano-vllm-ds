@@ -10,6 +10,8 @@ import os
 import argparse
 from time import perf_counter
 
+import torch
+
 DEFAULT_MODEL = "/nas_data/WR/models/Qwen2.5-7B-Instruct-GPTQ-Int4"
 
 PROMPTS = [
@@ -35,6 +37,22 @@ def _stats(name, ttfts, decodes, throughput=None, extra=""):
     if throughput:
         print(f"  Throughput : {throughput:8.1f} tok/s ({len(PROMPTS)} 请求并发) {extra}")
     return avg(ttfts), avg(decodes), throughput
+
+
+def _weights_gib(llm) -> float:
+    """模型权重实际占用的显存: int4 打包权重 + (cache 模式下)反量化后的 fp16 缓存。
+    注意 KV cache 会按剩余显存自动分配, 所以"进程显存峰值"看不出量化收益, 必须单算权重。"""
+    m = getattr(getattr(llm, "model_runner", None), "model", None)
+    if m is None:
+        return float("nan")
+    total = 0
+    for mod in m.modules():
+        for t in list(mod.parameters(recurse=False)) + list(mod.buffers(recurse=False)):
+            total += t.numel() * t.element_size()
+        wc = getattr(mod, "_w_cache", None)
+        if isinstance(wc, torch.Tensor):
+            total += wc.numel() * wc.element_size()
+    return total / 2 ** 30
 
 
 def bench_nanovllm(model, max_tokens):
@@ -70,11 +88,18 @@ def bench_nanovllm(model, max_tokens):
     total = sum(len(o["token_ids"]) for o in outs)
     tput = total / (perf_counter() - t0)
 
-    mode = "fused int4 dequant-GEMM (不物化 fp16 权重)" if os.getenv("NANOVLLM_GPTQ_FUSED") == "1" \
-        else ("权重缓存(fp16, dequant 一次)" if os.getenv("NANOVLLM_GPTQ_CACHE") == "1" \
-        else "朴素 on-the-fly dequant(每次 forward 重算)")
+    # 注意与 gptq_linear.py 的模式选择保持一致: 未设任何开关时默认是 fused。
+    mode = ("权重缓存 fp16 (dequant 一次, 显存回到 2B/param)"
+            if os.getenv("NANOVLLM_GPTQ_CACHE") == "1"
+            else "torch 朴素 on-the-fly dequant (旧实现, 仅对照)"
+            if os.getenv("NANOVLLM_GPTQ_TORCH") == "1"
+            else "stream: int4 常驻 + Triton dequant 到复用 buffer + cuBLAS"
+            if os.getenv("NANOVLLM_GPTQ_STREAM") == "1"
+            else "fused int4 dequant-GEMM (不物化 fp16 权重, 默认)")
     print(f"=== nano-vllm-ds (GPTQ, TP=1) [{mode}] ===")
     _stats("nanovllm", ttfts, decodes, tput)
+    print(f"  权重显存   : {_weights_gib(llm):6.2f} GiB "
+          f"(KV cache 由 nano-vllm 按剩余显存自动分配, 故不作为对比项)")
     del llm
     return ttfts, decodes, tput
 
@@ -134,12 +159,23 @@ def main():
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--max_tokens", type=int, default=128)
     parser.add_argument("--engine", default="both",
-                        choices=["nanovllm", "nanovllm-cache", "nanovllm-fused", "vllm", "both", "all"])
+                        choices=["nanovllm", "nanovllm-stream", "nanovllm-cache", "nanovllm-fused",
+                                 "nanovllm-torch", "vllm", "both", "all"])
     parser.add_argument("--json", action="store_true", help="机器可读输出, 供子进程间传递结果")
     args = parser.parse_args()
 
     # 单引擎: 直接测量
     if args.engine == "nanovllm":
+        ttfts, decodes, tput = bench_nanovllm(args.model, args.max_tokens)
+        _emit_json(args, ttfts, decodes, tput) if args.json else None
+        return
+    if args.engine == "nanovllm-stream":
+        os.environ["NANOVLLM_GPTQ_STREAM"] = "1"
+        ttfts, decodes, tput = bench_nanovllm(args.model, args.max_tokens)
+        _emit_json(args, ttfts, decodes, tput) if args.json else None
+        return
+    if args.engine == "nanovllm-torch":
+        os.environ["NANOVLLM_GPTQ_TORCH"] = "1"
         ttfts, decodes, tput = bench_nanovllm(args.model, args.max_tokens)
         _emit_json(args, ttfts, decodes, tput) if args.json else None
         return
@@ -159,8 +195,8 @@ def main():
         return
 
     # 多引擎: 各起独立子进程, 避免 CUDA 显存/上下文互相干扰
-    engines = ["nanovllm", "nanovllm-cache", "nanovllm-fused", "vllm"] if args.engine == "all" \
-        else ["nanovllm", "vllm"]
+    engines = ["nanovllm-stream", "nanovllm-cache", "nanovllm-fused", "nanovllm-torch", "vllm"] \
+        if args.engine == "all" else ["nanovllm", "vllm"]
     res = {}
     for eng in engines:
         print(f"########## 运行 {eng} (独立子进程) ##########")
