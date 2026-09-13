@@ -26,8 +26,11 @@
 
 1. **零点是唯一必踩的坑**：GPTQ(v1) 磁盘上的 `qzeros` 存的是「真实零点 − 1」，即 `z_true = unpack(qzeros) + 1`。用错不会报错，只会让输出看似流畅但内容错乱。
 2. **正确性要用强证据**：`mean(码字)≈真实零点` 这类弱启发式在有偏分布下会误判；正确做法是「黄金权重无损往返 + 变异测试」（见 §4）。
-3. **量化的显存收益由 `stream` 路径兑现**：int4 权重常驻显存只占 5.2 GiB，而 `cache` 模式反量化成 fp16 会膨胀到 14.2 GiB。`cache` 只是「精度/速度上界」的对照基准，**不能**拿它论证"量化没用"。
-4. **光把反量化融进 kernel 并不等于 Marlin**：`fused` 路径不物化 fp16 权重、吞吐 78.1 tok/s，但 `tl.dot` 的归约顺序与 cuBLAS 不同，decode 形状有 1~4 ulp 差异，被 28 层残差 + softmax 放大后贪心解码 0/64 匹配。**融合反量化 + 同款归约顺序**才是完整答案。
+3. **量化换的是显存，不是速度**（对比原版 nano-vLLM + 未量化模型，eager 同口径）：权重显存
+   **14.22 → 5.20 GiB（2.73×，省 9.02 GiB）**，4 并发吞吐 78.0 → 76.7 tok/s（**基本持平**），
+   TTFT 略慢 14%。`cache` 只是「速度上界」的对照基准，**不能**拿它论证"量化没用"。
+4. **「省显存 + 快 + 对齐 vLLM」可以三者兼得，但必须重写 GEMM**：`fused` 把反量化融进 GEMM、不物化 fp16 权重，得到 5.20 GiB + 77.4 tok/s + 64/64 —— 同显存下比 `stream`（58.8 tok/s）快 1.3×。这才是对标 Marlin 的正统路径，也是当前的**默认**。
+5. **别把"现象"当成"根因"（本教程最大的一次翻车）**：`fused` 曾长期 0/64，我们先归因为「`tl.dot` 归约顺序与 cuBLAS 不同 → ulp 被深残差放大」，并写了长篇分析。实测证伪：离线扫描 14 种归约顺序结果完全一致，且"更准"的 fp32 精确累加同样 64/64 —— 真因是 **`bias` 被加了两次**（`_forward_fused` 内一次、`forward()` 又一次），而 Qwen2 中只有 q/k/v 投影带 bias。**教训：先做同进程逐层 A/B 定位，再谈数值归因。** 详见 §7.1。
 
 ### 0.3 阅读地图
 
@@ -232,9 +235,9 @@ def _cached_weight(self):
     return self._w_cache
 ```
 
-速度最快（89.1 tok/s）且数值精确，但**显存回到 14.2 GiB，放弃了量化的运行期收益** —— 定位是"速度/精度上界"参照，不是推荐用法。
+速度最快（89.0 tok/s）且数值精确，但**显存回到 14.2 GiB，放弃了量化的运行期收益** —— 定位是"速度上界"参照，不是推荐用法。
 
-#### 路径 C：`stream`（**默认**：int4 常驻 + 复用 buffer + cuBLAS）
+#### 路径 C：`stream`（int4 常驻 + 复用 buffer + cuBLAS，`NANOVLLM_GPTQ_STREAM=1`）
 
 ```python
 def _forward_stream(self, xf):
@@ -250,27 +253,33 @@ def _forward_stream(self, xf):
 - **int4 权重常驻显存**（5.2 GiB），全程不展开成 fp16 权重张量。
 - 每次 forward 用 Triton 把权重解包到一块**全局复用**的 fp16 暂存区（按元素数向上取规格，一次分配、逐层覆写；同一 CUDA stream 顺序执行下安全），再交给 cuBLAS。
 - **数值 = cache 模式逐位相同**（喂给 cuBLAS 的是同一份 `(N, K)` fp16 权重），Part C 实测 64/64 匹配 vLLM。
-- 代价：比 cache 多一次 dequant 写 + cuBLAS 读（约 2× 权重带宽），吞吐 59.2 vs 89.1 tok/s。
+- 代价：比 cache 多一次 dequant 写 + cuBLAS 读（约 2× 权重带宽）；比 fused 也慢一截（58.8 vs 77.4 tok/s），因为它终究要把 fp16 权重物化一遍再读回来。
 
-> **怎么选**：要**省显存 + 精确匹配 vLLM** → 默认 `stream`；要**极限吞吐且不在乎显存** → `cache`（14.2 GiB）。
+> **怎么选**：要**省显存 + 精确 + 最快** → 默认 `fused`；要**极限吞吐且不在乎显存** → `cache`（14.2 GiB）；`stream` 保留作 fused 的数值对照基准（喂给 cuBLAS 的是同一份 fp16 权重，可用来隔离"GEMM 实现"与"反量化"两类误差）。
 
-#### 路径 D：`fused`（Triton dequant-GEMM，对标 Marlin）
+#### 路径 D：`fused`（Triton dequant-GEMM，对标 Marlin，**默认**）
 
 ```python
 def _forward_fused(self, xf):
-    """fused int4 dequant-GEMM (Triton): 不物化 fp16 权重。
+    """int4 dequant-GEMM 混合核: 不物化 fp16 权重。
     支持任意前导维度 (引擎在 prefill 时可能传 (batch, seq, in))。"""
     xc = xf.contiguous()
     *lead, K = xc.shape
     x2 = xc.reshape(-1, K)
     M = x2.shape[0]
-    out = fused_gptq_linear(x2, self.qweight, self.qzeros, self.scales,
-                            M, self.out_features, K, self.group_size)
+    fn = ordered_gptq_linear if M <= ORDERED_MAX_M else fused_gptq_linear
+    out = fn(x2, self.qweight, self.qzeros, self.scales,
+             M, self.out_features, K, self.group_size)
     out = out.reshape(*lead, self.out_features)
-    return out + self.bias if self.bias is not None else out
+    # bias 由 forward() 统一加, 这里**不能**再加一次 (§7 的 bug)
+    return out
 ```
 
-kernel 内直接 `acc += tl.dot(x, W_dequant)`，fp16 权重完全不落显存。已知局限见 §7.2。
+kernel 内直接 `acc += tl.dot(x, W_dequant)`，fp16 权重完全不落显存 —— 这是 weight-only 量化的正统加速路径，也是**唯一能同时拿到"int4 显存 + TensorCore 速度 + 对齐 vLLM"**的方案（原因见 §8 延伸思考）。
+
+数值特征见 §4.3：与 cuBLAS 在 prefill（M≥32）逐位一致，decode（M≤4）有 1~4 ulp 差异，但这不影响端到端（Part C 64/64，见 §4.4）。
+
+> `ORDERED_MAX_M` 默认 0：保留了一个 fp32 精确累加的 `ordered` 变体（无 tensor core、更慢），仅作数值对照，设 `NANOVLLM_GPTQ_ORDERED_MAX_M` 可启用。
 
 ### 3.5 Triton dequant kernel（`nanovllm/layers/gptq_dequant.py`，stream 的底座）
 
@@ -459,7 +468,11 @@ Part B 扫真实权重层（`q_proj` / `gate_proj` / `down_proj`）× M ∈ {1, 
 - `M ≥ 32`（prefill 类形状）：与 cuBLAS 逐位一致（都走 tensor core，归约顺序一致）。
 - `M ≤ 4`（decode 类形状）：cuBLAS 切到 gemv 类实现，归约顺序与 `tl.dot` 不同，fp32 累加差约 1e-6 相对量，落到 fp16 输出上就是极少数元素差 1~4 ulp。
 
-单层无害，但 28 层残差 + softmax 会把它放大成贪心 token 分歧（见 §4.4）。
+> ⚠️ **这段分析本身没错，但曾被错误地当成 fused 端到端失配的主因** —— 这是本教程最大的一次误判，见 §7.1 的证伪过程。
+>
+> 关键在于**归约顺序根本不是误差来源**：fp16×fp16 的乘积在 fp32 下可精确表示（11+11=22 位 < 24 位尾数），所以 fp32 累加的舍入误差约 1e-6 相对量，比 fp16 输出的 1 ulp（~5e-4）小三个数量级。离线扫描 14 种归约顺序（顺序 / 逆序 / 树形 / 8~256 各种分块 × 块内顺序 / 块内树形）**结果完全一致**，证实了这个判断。
+>
+> 而这 1~4 ulp 差异**不足以**让贪心解码分歧：修掉 §7.1 的 bias bug 后，纯 `tl.dot` 的 fused 在 Part C 实测 64/64（见 §4.4）。
 
 ### 4.4 Part C：端到端与 vLLM 逐 token 比对（ground truth）
 
@@ -477,9 +490,9 @@ outs = llm.generate(PROMPTS_C, SamplingParams(temperature=1e-9, max_tokens=32), 
 | stream | 64 / 64 | 逐 token 一致 |
 | cache | 64 / 64 | 逐 token 一致 |
 | torch | 64 / 64 | 逐 token 一致 |
-| **fused** | **0 / 64** | **首个 token 即分歧** |
+| **fused** | **64 / 64** | **逐 token 一致** |
 
-三条走 cuBLAS 的路径都精确对齐；fused 因 §4.3 的 decode 归约差异在深残差下被放大，**0/64** —— 这就是它不能作为默认路径的原因。
+四条路径全部精确对齐。（修复 §7.1 的 bias bug 之前，fused 是 **0/64**、首个 token 即分歧；修复后 64/64，因此它现在是**默认路径**。）
 
 ---
 
@@ -499,40 +512,138 @@ outs = llm.generate(PROMPTS_C, SamplingParams(temperature=1e-9, max_tokens=32), 
 
 | 路径 | TTFT (ms) | Decode 单请求 (tok/s) | 4 并发吞吐 (tok/s) | 权重显存 (GiB) | 相对 vLLM 吞吐 |
 |---|---|---|---|---|---|
-| torch（朴素 on-the-fly） | 456.2 | 2.2 | 8.5 | 5.20 | 0.02× |
-| **stream（默认）** | 51.3 | 18.8 | **59.2** | **5.20** | 0.17× |
-| fused（Triton dequant-GEMM） | — | — | **78.1** | 5.20 | 0.23× |
-| cache（fp16 缓存，仅对照） | 28.7 | 33.0 | **89.1** | 14.20 | 0.26× |
-| *vLLM gptq_marlin（参考）* | 8.9 | 106.0 | 343.6 | — | 1.00× |
-
-> fused 的 TTFT / 单请求 decode 未单独记录（该路径不参与默认部署），仅记录并发吞吐。
+| torch（朴素 on-the-fly） | 479.2 | 2.1 | 8.5 | 5.20 | 0.02× |
+| stream（int4 常驻 + 复用 buffer） | 52.1 | 18.7 | 58.8 | **5.20** | 0.17× |
+| **fused（Triton dequant-GEMM，默认）** | 35.1 | 27.7 | **77.4** | **5.20** | 0.22× |
+| cache（fp16 缓存，仅对照） | 28.8 | 32.7 | 89.0 | 14.20 | 0.26× |
+| *vLLM gptq_marlin（参考）* | 9.1 | 107.1 | 344.4 | — | 1.00× |
 
 **逐条解读**：
 
-- **cache vs torch**：TTFT 456.2 → 28.7 ms（**15.9×**），并发吞吐 8.5 → 89.1 tok/s（**10.5×**）。代价是显存回到 fp16 的 14.2 GiB。
-- **stream vs cache**：吞吐 59.2 vs 89.1（多付一次 dequant 写 + cuBLAS 读，约 2× 权重带宽），换回显存 **5.20 vs 14.20 GiB（2.7× 降幅）**，且数值逐位相同。
-- **fused vs stream**：吞吐 78.1 vs 59.2，显存同为 5.20 GiB（连暂存 buffer 都省了），但**数值在 decode 形状有 1~4 ulp 差异 → 端到端 0/64**。
-- **量化到底省不省显存？** 省 —— 由默认 `stream` 路径兑现（5.20 GiB）。`cache` 的 14.20 GiB 只是"精度/速度上界"对照，**不是**默认路径。
+- **cache vs torch**：TTFT 479 → 28.8 ms（**16.6×**），并发吞吐 8.5 → 89.0 tok/s（**10.5×**）。代价是显存回到 fp16 的 14.2 GiB。
+- **stream vs cache**：吞吐 58.8 vs 89.0（多付一次 dequant 写 + cuBLAS 读，约 2× 权重带宽），换回显存 **5.20 vs 14.20 GiB（2.7× 降幅）**，且数值逐位相同。
+- **fused vs stream**：**同显存（5.20 GiB）下吞吐 77.4 vs 58.8（1.32×）**，且 fused 连暂存 buffer 都省了。两者都是 64/64 对齐，所以 fused 严格占优 —— 这就是它现在是默认的原因。
+- **量化到底省不省显存？** 省 —— 由默认 `fused` 路径兑现（5.20 GiB）。`cache` 的 14.20 GiB 只是"速度上界"对照，**不是**默认路径。
 
-## 7. 与 vLLM Marlin 的差距与根因
+### 6.1 量化前 vs 量化后：与原版 nano-vLLM + 未量化模型的对比
 
-即使有 fused，我们仍只有 vLLM 的 **~23% 吞吐**。原因是两道坎：
+上面四条路径都是"自己跟自己比"。真正的收益要看**量化前 vs 量化后**：用**原版 nano-vLLM**
+（`/home/cdzk/WR/nano-vllm`，未加任何量化改动）跑**未量化的 Qwen2.5-7B-Instruct** 作基线，
+与我们的 GPTQ-Int4 默认路径对比。两者用**同一套测量口径**（同 4 条 prompt / 128 tokens / 4 并发）。
 
-### 7.1 反量化要融进 GEMM kernel（我们做了一半）
+> 复现：`python bench_fp16_baseline.py --eager`（脚本会把原版仓库插到 `sys.path[0]`，避免 import 到本仓库改过的 `nanovllm`）
 
-Marlin 把反量化融进 GEMM，**不把 fp16 权重物化到显存**（省一次 HBM 往返），这正是 weight-only 量化的"正统"加速路径。我们的 `fused` 做到了这一点（78.1 tok/s，显存 5.2 GiB）。
+| 指标 | 原版 nano-vLLM + 未量化模型 | 本仓库 + GPTQ-Int4（fused） | 变化 |
+|---|---|---|---|
+| 权重显存 | **14.22 GiB** | **5.20 GiB** | **−63.4%（2.73×，省 9.02 GiB）** |
+| 权重每个参数 | 2 B | 0.5 B | −75% |
+| 4 并发吞吐 | 78.0 tok/s | 76.7 tok/s | **−1.7%（基本持平）** |
+| TTFT | 31.5 ms | 35.8 ms | +13.7%（略慢） |
+| 单请求 Decode | 33.4 tok/s | 27.7 tok/s | −17.1% |
 
-### 7.2 但融合还不够，还得有同款归约顺序（我们没做）
+（各 3 轮取均值；基线波动 ±0.4 tok/s，GPTQ 波动 ±0.7 tok/s）
 
-`tl.dot` 的归约顺序 ≠ cuBLAS。Marlin 专门处理了这一点，而我们直接用通用 `tl.dot`，导致 decode 形状 1~4 ulp 差异，深残差放大后贪心分歧（0/64）。**这就是 naive Triton 融合追不平 Marlin 的根因**。
+**怎么解读**：
 
-### 7.3 调度栈差距
+- **显存是唯一实打实的收益**：9 GiB 的富余可以换成更大的 KV cache / 更高并发 / 更长上下文，
+  或者在更小显存的卡上部署。这是 weight-only 量化的真正价值。
+- **吞吐基本持平，不是"加速"**：int4 把权重访存降到 1/4，但我们的 fused kernel 是逐元素 shift
+  解包、没有做 Marlin 那样的权重 repack，解包开销吃掉了带宽红利；同时 TTFT 因 prefill 时
+  int4 解包路径更长而慢了约 14%。**量化 ≠ 加速**，它换的是显存。
+- **诚实口径**：两侧都是 **eager**。我们的 GPTQ 路径被引擎强制 `enforce_eager=True`，
+  而原版 fp16 默认开 CUDA Graph —— 但**原版的 CUDA Graph 在当前环境（torch 2.7）本身就跑不通**
+  （捕获时报 `operation not permitted when stream is capturing`），所以无法给出"原版 + CUDA Graph"的数字。
+  若它能跑通，fp16 基线会更快，量化侧的吞吐差距会更大。
+- **dtype 差异**：未量化模型的 `config.torch_dtype` 是 **bfloat16**（Qwen2.5 官方权重即 bf16），
+  GPTQ 模型是 float16。两者都是 2 字节、都走 TensorCore，对结论无实质影响。
+
+> **为跑通基线而修的原版仓库问题**（仅影响基线测量，与量化实现无关）：
+> ① `Config` 是 `@dataclass(slots=True)`，但 `__post_init__` 给未声明的 `model_class` 赋值 → 补声明该字段；
+> ② `hf_config.dtype` 在新版 transformers 已改名 `torch_dtype`；
+> ③ `qkv_bias=getattr(config,'attention_bias',False)` 取到 False，而 Qwen2.5 checkpoint **带** q/k/v bias → 默认值改 True。
+>
+> 顺带一提：这个 bias 也正是 §7 那个 bug 的同类 —— 量化路径若不支持 bias，Qwen2 的 q/k/v 就会静默出错。
+
+## 7. 最大的一次翻车：fused 失配的真因是 bias，不是归约顺序
+
+这一节记录本教程中最有价值的一次教训 —— **我们曾把一个纯粹的 bug，误判成深刻的数值原理问题，并据此写了一整套分析。**
+
+### 7.1 现象与误判
+
+fused 路径在 Part C 长期 **0/64**（首个 token 即分歧）。当时已有的证据是：
+
+- Part B2 显示 fused 与 cuBLAS 在 decode 形状差 1~4 ulp，且 `|fused − 真值|` 与 `|cuBLAS − 真值|` 同量级（有时 fused 更准）。
+- 于是结论：「`tl.dot` 归约顺序 ≠ cuBLAS → ulp 差异 → 被 28 层残差 + softmax 放大 → 贪心分歧」。
+
+这个推理听起来很自洽，但它是**错的**。
+
+### 7.2 证伪：三件事让这个解释站不住脚
+
+1. **离线扫描 14 种归约顺序，结果完全一致。**
+   把 `sum_k A[m,k]·B[k,n]` 用顺序 / 逆序 / 树形 / 8~256 各种分块（块内顺序 / 块内树形）逐一实现并与 cuBLAS 比对，所有顺序的失配数与最大误差**完全相同**。若归约顺序真是误差来源，不同顺序不可能给出同一个答案。
+   
+   原理也支持这点：fp16×fp16 的乘积在 fp32 下可**精确**表示（11+11=22 位 < 24 位尾数），所以误差只剩 fp32 归约舍入（~1e-6 相对量），比 fp16 输出的 1 ulp（~5e-4）小三个数量级 —— 任何归约顺序都会舍入到同一个 fp16 值。
+
+2. **"更准"的实现同样 64/64，说明精度不是门槛。**
+   把 GEMM 换成 fp32 精确累加（`x.float() @ W.float()`，即比 cuBLAS 更准），端到端实测仍是 **64/64**。如果"与 cuBLAS 差 ulp"就会导致分歧，那这个更不准的方向早该崩了。
+
+3. **同进程逐层 A/B 直接定位到了真正的错误层。**
+   这是决定性的一步：在同一次 forward 里，对每个 GPTQ 层同时算
+   `A = dequantize_gptq + cuBLAS`（已知正确，stream 用的就是它）与 `B = 当前 forward 输出`，逐层比对。结果：
+
+   | 子层 | max abs diff | 判定 |
+   |---|---|---|
+   | q_proj | 48.3 | ❌ 灾难性偏差 |
+   | k_proj | 171.1 | ❌ 灾难性偏差 |
+   | v_proj | 2.58 | ❌ 灾难性偏差 |
+   | o_proj | 9.8e−04 | ✅ 正常（1 ulp） |
+   | gate_proj | 7.8e−03 | ✅ 正常 |
+   | up_proj | 9.8e−04 | ✅ 正常 |
+   | down_proj | 3.9e−03 | ✅ 正常 |
+
+   **只有 q / k / v 错，且是"整体偏移一个常量"的形态。** 而 Qwen2 里 q/k/v 恰好是**唯一带 bias 的投影** —— 于是真凶一目了然。
+
+### 7.3 真因：bias 被加了两次
+
+```python
+def forward(self, x):
+    out = self._forward_fused(xf)     # ← 内部已经加过 bias
+    ...
+    if self.bias is not None:
+        out = out + self.bias         # ← forward() 又加了一次
+```
+
+`_forward_fused` 为了处理 `(batch, seq, in)` 的前导维度，在 reshape 后自行加了 bias；而 `forward()` 对所有路径统一再加一次。stream / cache / torch 三条路径都不在内部加 bias，所以只有 fused 踩中。
+
+**为什么它伪装得这么好**：
+
+- 只有 q/k/v 有 bias，MLP 的 gate/up/down 与 o_proj 都没有 —— 所以单层测试若只看 MLP 层，会得出"fused 精度正常（1 ulp）"的结论，完全看不出问题。
+- 偏差形态是"整体平移"，输出分布看起来依然合理，不像是坏了。
+- 它恰好和"1~4 ulp 归约差异"同时存在，让人很自然地把因果挂到了更"深刻"的那一方。
+
+**修复**：删掉 `_forward_fused` 里的 bias 加法。修复后**纯 `tl.dot` 的 fused 直接 64/64**，无需任何高精度或自定义归约 —— 也就证明了那 1~4 ulp 从来都不是问题。
+
+### 7.4 教训
+
+1. **先定位，再归因。** 用同进程逐层 A/B（而不是跨进程端到端指标）把问题收敛到具体层和具体形态，再谈原理。"哪个层错"比"误差多大"信息量大得多。
+2. **ulp 级差异≠分歧。** 贪心解码对 argmax 敏感，但实测 1~4 ulp 完全不影响；真正让它崩的是常量偏移这种结构性错误。
+3. **对"优雅的解释"保持警惕。** 越是把 bug 解释成深刻原理，越要先做证伪实验（这里是"扫遍所有归约顺序"和"故意做得更准"）。
+
+## 8. 与 vLLM Marlin 的真实差距
+
+修好 bias 后 fused 已 64/64 对齐，所以我们与 vLLM 的差距**不再是数值问题，纯粹是工程优化程度**：77.4 vs 344.4 tok/s（0.22×）。
+
+### 8.1 kernel 质量：我们没做权重 repack
+
+Marlin 会把 int4 权重**预重排**成 TensorCore mma 友好的布局（交错、按 mma 的 k 维分块连续），让解包后的数据直接喂 mma、访存完全 coalesced。我们的 `fused` 是逐元素 shift 解包，访存效率明显更低 —— 这是吞吐差距的主要来源之一。
+
+### 8.2 调度栈差距
 
 vLLM 还叠加了 CUDA Graph、FlashAttention、更细的调度与 prefix cache；我们是 python/torch 朴素实现，且 GPTQ 动态反量化目前**强制 eager**（`model_runner.py`），拿不到 CUDA Graph 的收益。
 
 > 这个差距本身就是最好的面试素材：**量化推理的加速不来自"权重变小"，而来自"反量化不再显式落盘"——kernel 内融合 + 与 cuBLAS 同款归约顺序才是关键**。
 
-## 8. 测量口径（诚实性）
+## 9. 测量口径（诚实性）
 
 - vLLM 离线 API 的 `RequestOutput.metrics` 在本环境为 `None`，TTFT 用 `max_tokens=1` 端到端计时（含 1 个 decode step + 调度开销），**略微高估 vLLM 的 TTFT**，即对比偏保守。
 - nano-vLLM 的 TTFT = 首个 prefill step 完成耗时；Decode 从首 token 后开始计时。
@@ -543,7 +654,7 @@ vLLM 还叠加了 CUDA Graph、FlashAttention、更细的调度与 prefix cache�
 
 # 第四部分：复现
 
-## 9. 复现命令
+## 10. 复现命令
 
 ```bash
 # 环境
@@ -582,28 +693,30 @@ $PY test_gen.py
 
 ## 项目描述（约 60 字）
 
-在自研极简推理引擎中实现 GPTQ-4bit 权重量化推理，打通 bit 解包→零点对齐→反量化→GEMM 的完整链路；设计"黄金往返 + 变异测试"的强证据验证方案替代弱启发式；最终落地 `stream` 默认路径（int4 常驻显存 + 复用 buffer + cuBLAS），在保持量化显存收益（5.2 GiB vs fp16 14.2 GiB）的同时做到与 vLLM 逐 token 一致，吞吐 8.5 → 59.2 tok/s。
+在自研极简推理引擎中实现 GPTQ-4bit 权重量化推理，打通 bit 解包→零点对齐→反量化→GEMM 的完整链路；设计"黄金往返 + 变异测试"的强证据验证方案替代弱启发式；自研 Triton **fused dequant-GEMM**（int4 常驻、fp16 权重不物化）作为默认路径，在保持量化显存收益（5.2 GiB vs fp16 14.2 GiB）的同时做到与 vLLM 逐 token 一致，吞吐 8.5 → 77.4 tok/s。
 
 ## 职责与成果（bullet，可直接贴）
 
 - 在 ~2k 行的极简推理引擎中落地 GPTQ-Int4 支持：实现 int32 位解包、零点约定对齐（`z_true = qzeros + 1`）、group-wise 反量化与分块 matmul，复用原有 TP 切分与权重加载路径，**无需改动引擎调度**；同时给出四条可切换执行路径（stream / cache / fused / torch）。
 - 设计**强证据的**正确性验证：自造"能被 int4 精确表示"的黄金权重做无损往返（max|err|=0），再用变异测试（注入零点 / 轴序 / 分组 / 解包序等 5 类错误）验证测试**有判别力**（每条错误都被抓住，而 `mean(码字)≈零点` 这类弱启发式会漏判）；并以 vLLM `gptq_marlin` 为 ground truth 做贪心逐 token 比对，**64/64 全匹配**。
-- 定位朴素反量化的**显存带宽瓶颈**（torch 路径访存量约权重的 30 倍，单 forward ~0.5s，仅 2 tok/s），实现"反量化一次缓存 fp16"优化，TTFT **15.9×**、并发吞吐 **10.5×**（8.5 → 89.1 tok/s）。
-- 用 **fp64 真值归因** 做精度校验：确认 deep 残差模型里任何反量化数值偏差都会被注意力 softmax 逐层放大成贪心 token 分歧 —— 因此默认路径必须保证与 vLLM 数值逐位对齐。
-- 落地 `stream` 默认路径（Triton 快速解包到复用 buffer + cuBLAS）：**量化运行期显存收益真正落到默认路径**（5.2 GiB vs fp16 14.2 GiB，2.7× 降幅），与 vLLM 逐 token 一致，吞吐 8.5（朴素）→ 59.2 tok/s。
-- 实现 Triton **fused dequant-GEMM**（fp16 权重不物化，吞吐 78.1 tok/s）并定位其与 Marlin 的本质差距：修复组号计算与 decode 分块占用率两个 bug 后，确认剩余差异来自 `tl.dot` 与 cuBLAS 的归约顺序不同（decode 形状 1~4 ulp，端到端 0/64）—— 明确了下一步要写同款归约顺序的自定义 TensorCore kernel。
+- 定位朴素反量化的**显存带宽瓶颈**（torch 路径访存量约权重的 30 倍，单 forward ~0.5s，仅 2 tok/s），实现"反量化一次缓存 fp16"优化，TTFT **16.6×**、并发吞吐 **10.5×**（8.5 → 89.0 tok/s）。
+- 自研 Triton **fused dequant-GEMM 作为默认路径**：把反量化融进 GEMM kernel、fp16 权重完全不物化，int4 常驻显存 **5.2 GiB vs fp16 14.2 GiB（2.7× 降幅）**，与 vLLM 逐 token 一致（64/64），吞吐 8.5（朴素）→ **77.4 tok/s**；同显存下比"int4 常驻 + 复用 buffer + cuBLAS"的 stream 方案（58.8）快 **1.32×**。
+- 以**原版引擎 + 未量化模型**为基线做同口径对比，量化后**权重显存 14.22 → 5.20 GiB（省 9 GiB）而吞吐基本持平（78.0 → 76.7 tok/s）**，据此把量化价值准确定位为**显存余量/并发能力**而非"加速"，避免了"量化能提速"的常见误述。
+- 用 **fp64 真值归因 + 同进程逐层 A/B** 定位一个隐藏很深的 bug：fused 端到端 0/64 的真因是 **bias 被加了两次**（`_forward_fused` 内一次、`forward()` 又一次），而 Qwen2 中只有 q/k/v 带 bias，故仅这三个投影整体偏移；同时用"扫遍 14 种归约顺序结果完全一致 + 故意做得更准仍 64/64"**证伪**了原先"归约顺序导致分歧"的误判。
 
 ## 量化指标（放简历"成绩"栏）
 
-| 指标 | torch(朴素) | stream(默认) | fused | cache(对照) | vLLM |
-|---|---|---|---|---|---|
-| 4 并发总吞吐 (tok/s) | 8.5 | 59.2 | 78.1 | 89.1 | 343.6 |
-| 首 token 时延 TTFT (ms) | 456.2 | 51.3 | — | 28.7 | 8.9 |
-| 与 vLLM 吞吐比 | 0.02× | 0.17× | 0.23× | 0.26× | 1.00× |
-| 权重显存 (GiB) | 5.20 | **5.20** | 5.20 | 14.20 | — |
-| 端到端 token 匹配 vLLM | 64/64 | 64/64 | **0/64** | 64/64 | — |
+| 指标 | 原版+未量化(基线) | torch(朴素) | stream | **fused(默认)** | cache(对照) | vLLM |
+|---|---|---|---|---|---|---|
+| 权重显存 (GiB) | 14.22 | 5.20 | 5.20 | **5.20** | 14.20 | — |
+| 4 并发吞吐 (tok/s) | 78.0 | 8.5 | 58.8 | **76.7** | 89.0 | 344.4 |
+| 与 vLLM 吞吐比 | 0.23× | 0.02× | 0.17× | **0.22×** | 0.26× | 1.00× |
+| TTFT (ms) | 31.5 | 479.2 | 52.1 | 35.8 | 28.8 | 9.1 |
+| 端到端 token 匹配 vLLM | — | 64/64 | 64/64 | **64/64** | 64/64 | — |
 
-> stream = int4 常驻 + 复用 buffer + cuBLAS；fused = kernel 内融合反量化（不物化 fp16，但有归约顺序差异）；cache = 反量化一次缓存 fp16（容量↔带宽 trade-off，仅对照）。
+**量化前后（同口径，均为 eager）**：显存 **2.73× 降幅（省 9.02 GiB）**，吞吐持平，TTFT +14%。
+
+> fused = kernel 内融合反量化（int4 常驻、fp16 不物化，默认）；stream = int4 常驻 + 复用 buffer + cuBLAS；cache = 反量化一次缓存 fp16（容量↔带宽 trade-off，仅对照）；原版+未量化 = 用未改动的上游 nano-vLLM 跑 Qwen2.5-7B-Instruct（bf16）作基线（`bench_fp16_baseline.py --eager`）。
 
 ## 技术栈 / 关键词
 
@@ -620,17 +733,19 @@ PyTorch、Triton、GPTQ、weight-only quantization、int4 位解包、group-wise
 2. 用**黄金往返 + 变异测试**发现并修复零点偏移 —— `mean(码字)≈零点` 这种弱启发式会漏判，只有"注入错误还能抓住"的测试才可信。
 3. 分块反量化 + fp32 中间累加 + fp16 输出，对齐 vLLM 的数值行为，避免 fp16 溢出。
 4. 正确性用**四层验证**：黄金往返 / 变异测试（强证据）+ 单层 fused-vs-cuBLAS + fp64 真值归因 + vLLM ground truth 逐 token 比对（64/64）。
-5. 性能剖析定位 bandwidth-bound，先后做 dequant-cache 与 stream（int4 常驻 + 复用 buffer）两条优化路径。
-6. 写 Triton fused dequant-GEMM 对标 Marlin，并用 fp64 归因定位到"归约顺序"这个真正的根因。
+5. 性能剖析定位 bandwidth-bound，先后做 dequant-cache、stream（int4 常驻 + 复用 buffer）与 **fused（反量化融进 GEMM，fp16 不物化）** 三条优化路径，后者成为默认。
+6. fused 曾端到端 0/64，一度误判为"归约顺序"；用**同进程逐层 A/B** 收敛到只有 q/k/v 偏差，进而定位真因 **bias 加两次**；并用"扫遍 14 种归约顺序结果一致 + 故意更准仍 64/64"完成证伪。
 
-**R（结果）**：正确性 64/64 全匹配；吞吐 8.5 → 59.2 tok/s（fused 78.1）；权重显存 14.2 → 5.2 GiB（2.7× 降幅）；并形成对"量化加速本质 = kernel 内融合反量化 + 同款归约顺序"的系统性认知。
+**R（结果）**：正确性 64/64 全匹配；吞吐 8.5 → **77.4 tok/s**；权重显存 14.2 → 5.2 GiB（2.7× 降幅）；并形成对"量化加速本质 = kernel 内融合反量化 + 权重 repack 到 mma 友好布局"的系统性认知。
 
 ## 延伸思考（面试官最爱追问）
 
 - **为什么不一上来就写 CUDA kernel？** 先用 torch 朴素实现 + 正确性与基线对齐，确认算法正确再谈性能；过早优化会淹没 bug。
-- **下一步怎么追平 vLLM？** 两道坎：① **归约精度** —— 写与 cuBLAS 同款归约顺序的自定义 TensorCore kernel（Marlin 的做法），而非直接用通用 `tl.dot`；② **调度栈** —— 接入 CUDA Graph（当前 GPTQ 因动态反量化强制 eager）、FlashAttention 与 paged KV cache。两者都补齐才有望从 0.23× 追到 1×。
-- **为什么不直接用 fused 当默认？** 它在 decode 形状（M≤4）与 cuBLAS 有 1~4 ulp 差异，28 层残差里被 softmax 放大成贪心 token 分歧（实测 0/64）。它证明了融合反量化的写法与内存收益，但因归约顺序问题与深残差模型不兼容，故默认走 `stream`。
-- **cache 模式显存为什么反而变大？** 它是用 fp16 容量换带宽的 trade-off，只作"速度/精度上界"对照；真正的量化收益由默认 `stream` 路径（int4 常驻）体现（5.2 vs 14.2 GiB）。
+- **fused 已经是默认了，它和 Marlin 的本质差距在哪？** 不是数值（已 64/64 对齐），而是 **kernel 质量**：Marlin 会把 int4 权重**预重排（repack）**成 TensorCore mma 友好的布局，解包后直接喂 mma、访存完全 coalesced；我们是逐元素 shift 解包。其次是**调度栈**（CUDA Graph / FlashAttention / paged KV cache）。这两块补齐才有望从 0.22× 追到 1×。
+- **下一步最划算的优化是什么？** 让 GPTQ 也能用 **CUDA Graph**。目前引擎对 `quantization=="gptq"` 无条件 `enforce_eager=True`，理由是"动态反量化不兼容 graph"；但 `fused` 路径 int4 常驻、kernel 内解包，**没有每步动态申请的反量化 buffer**，理论上可以捕获。这能直接砍掉 decode 每步的 kernel launch 开销 —— 而我们的单请求 decode（27.7）慢于未量化基线（33.4），主要就慢在这里。
+- **既然要省显存又不物化 fp16，为什么不直接调 cuBLAS？** cuBLAS **没有** int4 dequant-GEMM（只有 INT8，且不支持非对称 per-group dequant）。所以只要反量化发生在 GEMM 外，就只能在"物化 fp16（cache，放弃显存）"和"每步重算（stream，用带宽换显存）"之间二选一 —— 想三者兼得就必须**重写 GEMM**，这正是 fused 做的事。
+- **1~4 ulp 的差异会不会导致输出分歧？** 实测不会。贪心解码对 argmax 敏感，但只有结构性错误（如 bias 多加一次导致的常量偏移）才会稳定翻转 token；ulp 级噪声在 28 层里并不会改变 argmax（详见 §7 的证伪）。
+- **cache 模式显存为什么反而变大？** 它是用 fp16 容量换带宽的 trade-off，只作"速度上界"对照；真正的量化收益由默认 `fused` 路径（int4 常驻）体现（5.2 vs 14.2 GiB）。
 - **GPTQ-v2 / AWQ / GGUF 怎么扩展？** 零点是 `qzeros` 本身（不需 +1）即 GPTQ-v2；AWQ 是 `W = Q * s + z` 的反向缩放 + act-order；GGUF 是另一套打包（需转 `q8_0` 等）。架构上只需新增 `unpack`/`dequant` 与 loader 映射 —— 本实现已按"四条路径 + 可插拔 dequant"组织。
 
 ---
