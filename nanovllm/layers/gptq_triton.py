@@ -35,48 +35,86 @@ def _fused_gptq_mm(
     M, N, K, GS: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    msk_m = offs_m[:, None] < M
-    msk_n = offs_n[None, :] < N
-    n_div = offs_n // 8                                    # qzeros 沿 N 打包, 每 8 个一个 int32
-    n_sub = (offs_n % 8) * 4
+    """Fused int4 dequant-GEMM kernel (GPTQ symmetric, group_size=GS).
 
+    一次性完成「解包 int4 码字 -> 反量化到 fp16 -> GEMM」, fp16 权重完全不在显存/
+    共享内存里物化 (int4 常驻, kernel 内按需解包后直接喂 TensorCore)。
+    计算: out[M, N] = x[M, K] @ W[N, K].T, 其中 W 由 qweight/qzeros/scales 反量化得到。
+
+    网格划分: 2D grid, (pid_m, pid_n) 各负责输出矩阵的一个 (BLOCK_M, BLOCK_N) 块,
+    即把 C[M,N] 沿行/列切成 BLOCK_M×BLOCK_N 的瓦片, 每个 CTA 算一块。
+    K 维在 CTA 内部用 BLOCK_K 循环归约 (BLOCK_K 不必等于 GS)。
+    """
+    # ---- 1. CTA 负责的输出块坐标 ----
+    pid_m = tl.program_id(0)                               # 输出行块索引
+    pid_n = tl.program_id(1)                               # 输出列块索引
+    # 本 CTA 负责的 (全局) 行/列下标 (含可能越界的部分, 越界由 mask 屏蔽)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)       # (BLOCK_M,) 输出行
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)       # (BLOCK_N,) 输出列
+    msk_m = offs_m[:, None] < M                            # (BM,1) 行越界屏蔽
+    msk_n = offs_n[None, :] < N                            # (1,BN) 列越界屏蔽
+
+    # ---- 2. qzeros 的 "沿 N 打包" 索引预计算 ----
+    # qzeros 形状 (K//GS, N//8): 沿输出维 N 每 8 个 4-bit 零点塞进一个 int32。
+    # 对某个输出下标 n, 它属于第 n//8 个 int32 字, 字内偏移 (n%8)*4 位。
+    n_div = offs_n // 8                                    # (BLOCK_N,) 字内第几个 int32
+    n_sub = (offs_n % 8) * 4                               # (BLOCK_N,) 字内位移(比特)
+
+    # ---- 3. 累加器, fp32 保精度 ----
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for kk in range(tl.cdiv(K, BLOCK_K)):
-        k0 = kk * BLOCK_K
-        offs_k = k0 + tl.arange(0, BLOCK_K)
-        k_msk = offs_k < K                                 # (BLOCK_K,)
-        km = k_msk[:, None] & msk_n                        # (BLOCK_K, BLOCK_N)  msk_n 已是 (1, BN)
 
-        # 激活 (BLOCK_M, BLOCK_K)
+    # ---- 4. K 维 (归约维) 分块循环 ----
+    for kk in range(tl.cdiv(K, BLOCK_K)):
+        k0 = kk * BLOCK_K                                  # 本块在 K 维的起点
+        offs_k = k0 + tl.arange(0, BLOCK_K)               # (BLOCK_K,) 本块覆盖的 K 下标
+        k_msk = offs_k < K                                 # (BLOCK_K,) K 越界屏蔽
+        # km: 权重码字加载掩码, 同时屏蔽 "K 越界" 与 "输出列越界"
+        km = k_msk[:, None] & msk_n                        # (BLOCK_K, BLOCK_N)
+
+        # 4.1 加载激活 (BLOCK_M, BLOCK_K)
+        # x 行主序: x[m, k] = x_ptr[m*K + k]。越界处填 0.0 不影响结果。
         x = tl.load(x_ptr + (offs_m[:, None] * K + offs_k[None, :]),
                     mask=msk_m & k_msk[None, :], other=0.0).to(tl.float16)
 
-        # 组号: BLOCK_K <= GS 时整块同组, 只取 (1,) 个组 -> z/s 是 (1, BLOCK_N), 省共享内存;
-        # 否则逐元素取 (BLOCK_K,)。旧版写死 g = k0//GS, 只在 BLOCK_K == GS 时正确。
+        # 4.2 解析本块对应的量化组号 g = k // GS, 并加载该组的零点/缩放
+        # 关键修正点: 组号必须按 "逐元素 k 下标" 计算, 不能按块起点 k0 算。
+        #   - BLOCK_K <= GS 时, 整块落在同一个组里 (g 全相同), 只需取 1 个组号 ->
+        #     z/s 形状 (1, BLOCK_N), 省共享内存。
+        #   - BLOCK_K >  GS 时, 块内跨多个组, 必须逐元素算 (BLOCK_K,) 组号。
+        #   旧版写死 g = k0//GS, 仅在 BLOCK_K == GS 时碰巧正确, 否则整块组号错。
         if BLOCK_K <= GS:
-            g_idx = tl.full((1,), k0 // GS, tl.int32)
+            g_idx = tl.full((1,), k0 // GS, tl.int32)       # (1,) 整块同组
         else:
-            g_idx = offs_k // GS
-        gm = (g_idx[:, None] >= 0) & msk_n                 # 与 g_idx 同形的全真掩码
+            g_idx = offs_k // GS                           # (BLOCK_K,) 逐元素组号
+        # gm: 零点/缩放加载掩码 (与 g_idx 同形)。g 恒 >= 0, 这里等价于 msk_n 广播。
+        gm = (g_idx[:, None] >= 0) & msk_n                 # (G, BLOCK_N)
+
+        # 零点: 从 qzeros[g_idx, n_div] 取出 int32 字, 右移 n_sub 位取低 4 位,
+        # 再加 1 得到真实零点 (GPTQ v1 约定 z_true = unpack(qzeros) + 1)。
         qz = tl.load(qz_ptr + g_idx[:, None] * (N // 8) + n_div[None, :], mask=gm, other=0).to(tl.uint32)
         z = ((qz >> n_sub[None, :]) & 0xF).to(tl.float32) + 1.0        # (1|BLOCK_K, BLOCK_N)
+        # 缩放: 直接从 scales[g_idx, n] 取, 形状 (1|BLOCK_K, BLOCK_N)。
         s = tl.load(sc_ptr + g_idx[:, None] * N + offs_n[None, :], mask=gm, other=0.0).to(tl.float32)
 
-        # 权重码字 (BLOCK_K, BLOCK_N): 输入行 k 对应 qweight 行 k//8, 位移 (k%8)*4。
-        # 用指针算术逐元素解包, 避开 tl.cat / tl.reshape / tl.permute (见文件头说明)。
-        r = offs_k // 8
-        sub = (offs_k % 8) * 4
+        # 4.3 解包权重 int4 码字 (BLOCK_K, BLOCK_N)
+        # qweight 形状 (K//8, N): 沿 K 维每 8 个 4-bit 码字塞进一个 int32。
+        # 对 K 下标 k: 它落在第 r=k//8 个 int32 字, 字内位移 sub=(k%8)*4 位。
+        # 用指针算术逐元素解包 (r[:,None]*N + offs_n[None,:]), 不开 tl.cat/reshape/
+        # permute 以保证 Triton 能正确推断内存布局 (见文件头说明)。
+        r = offs_k // 8                                    # (BLOCK_K,) 字行号
+        sub = (offs_k % 8) * 4                             # (BLOCK_K,) 字内位移(比特)
         qw = tl.load(qw_ptr + (r[:, None] * N + offs_n[None, :]), mask=km, other=0).to(tl.uint32)
-        codes = (qw >> sub[:, None]) & 0xF                              # (BLOCK_K, BLOCK_N)
+        codes = (qw >> sub[:, None]) & 0xF                              # (BLOCK_K, BLOCK_N) 0..15
 
-        # 反量化在 fp32 下做, 仅在喂 TensorCore 前转 fp16
+        # 4.4 反量化 + GEMM (核心: 解包与 GEMM 在 kernel 内融合)
+        # 反量化全程在 fp32 下做: W = (codes - z) * s, 只在喂 TensorCore 前转 fp16,
+        # 这样 fp16 权重不落显存、不落共享内存, 省显存又省一次物化。
+        # fp16*fp16 的乘积在 fp32 下可精确表示 (22 位尾数 < 24 位), 故转 fp16 精度损失极小。
         W = ((codes.to(tl.float32) - z) * s).to(tl.float16)
-        acc += tl.dot(x, W)
+        acc += tl.dot(x, W)                               # (BM,BN) fp32 累加, TensorCore 执行
 
+    # ---- 5. 写回输出 ----
+    # acc(fp32) -> fp16, 按 (BM,BN) 块写回, 同时屏蔽行/列越界。
     tl.store(out_ptr + offs_m[:, None] * N + offs_n[None, :],
              acc.to(tl.float16), mask=msk_m & msk_n)
 
