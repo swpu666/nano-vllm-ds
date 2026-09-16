@@ -245,7 +245,7 @@ def part_B():
         sc = t[".scales"].to(DEV)
         K, N = qw.shape[0] * 8, qw.shape[1]           # qweight: (K//8, N)
         layer = make_layer_from_packed(qw, qz, sc, N, K)
-        W = deq(layer).half()                          # (N, K) fp16 —— 与 cache 模式逐位相同
+        W = deq(layer).half()                          # (N, K) fp16 —— 与 torch 路径逐位相同
         bias = t[".bias"].to(DEV) if t[".bias"] is not None else None
 
         for M in (1, 4, 32, 256):
@@ -357,7 +357,6 @@ def _run(mode: str, max_tokens: int = 32):
          % (mode.upper(), mode, max_tokens))
     env = dict(os.environ)
     env.pop("NANOVLLM_GPTQ_FUSED", None)
-    env.pop("NANOVLLM_GPTQ_CACHE", None)
     env.pop("NANOVLLM_GPTQ_TORCH", None)
     p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                        env=env, cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -379,11 +378,11 @@ def part_C():
     print("=" * 78)
     print("Part C: 端到端贪心一致性 (各路径 vs vLLM gptq_marlin, 2 prompts x 32 tokens)")
     print("=" * 78)
-    modes = ["stream", "cache", "fused", "torch"]
+    modes = ["fused", "torch"]
     ref = _run("vllm")
     if ref is None:
-        print("  [!] vLLM 不可用, 改用 cache 模式作参考")
-        ref = _run("cache")
+        print("  [!] vLLM 不可用, 改用 torch 路径作参考")
+        ref = _run("torch")
     print(f"  {'mode':<10}{'匹配/总数':>14}{'首个分歧位置':>14}   结论")
     for m in modes:
         got = _run(m)

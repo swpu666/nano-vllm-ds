@@ -24,9 +24,8 @@ import triton.language as tl
 #   * M>=32 (prefill 类形状): 与 cuBLAS 的 fp16 **输出** 逐位一致。
 #   * M<=4 (decode 类形状): cuBLAS 会切到 gemv 类实现, 归约顺序与 tl.dot 不同, 落到 fp16
 #     输出上有少量元素差 1~4 ulp。
-#   * 但这点差异**不足以**让贪心解码分歧: 修掉 bias 重复相加的 bug 后, 纯 tl.dot 在
-#     Part C 实测与 vLLM(gptq_marlin) 64/64 一致。
-#     (历史误判: 曾把这 1~4 ulp 当成 fused 0/64 的主因, 实测证伪 —— 真因是 bias 加两次。)
+#   * 这点差异**不足以**让贪心解码分歧: 纯 tl.dot 的 fused 在 Part C 实测与
+#     vLLM(gptq_marlin) 64/64 一致。
 
 
 @triton.jit
@@ -137,9 +136,8 @@ def _ordered_gptq_mm(
         数量级 -> 任何归约顺序都舍入到同一个 fp16 值。离线扫描 14 种归约顺序
         (顺序/逆序/树形/各种分块) 结果确实完全一致, 证实归约顺序不是误差来源。
       * 反直觉但被实验证实: "更准"并不会与 vLLM 失配 (端到端探针 64/64)。
-      * 但它**不是必需的**: fused 当初 0/64 的真因是 bias 被加了两次, 修掉后纯 tl.dot
-        就已 64/64; 而本核没有 tensor core、明显更慢, 故默认关闭 (ORDERED_MAX_M=0),
-        仅作为"fp32 精确累加"的数值参考实现保留。
+      * 本核**非必需**: 纯 tl.dot 的 fused 已 64/64 对齐; 而本核没有 tensor core、
+        明显更慢, 故默认关闭 (ORDERED_MAX_M=0), 仅作为"fp32 精确累加"的数值参考实现保留。
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -248,10 +246,9 @@ def fused_gptq_linear(x: torch.Tensor, qweight: torch.Tensor, qzeros: torch.Tens
 
 # M <= ORDERED_MAX_M 时走 ordered(fp32 精确) 核, 否则走 tl.dot(fp16)。
 #
-# 默认 **0 = 关闭**: 已实测纯 tl.dot 在修掉 bias 重复相加的 bug 后就是 64/64 对齐的,
-# 而 ordered 没有 tensor core、明显更慢, 所以默认全部走 tl.dot。
-# 保留该开关纯作对照/调试用 (置为一个大数可强制全程走 fp32 精确累加)。
-# 详见 gptq_linear.py 中关于 bias 的说明 —— fused 失配的真因是 bias, 不是归约顺序。
+# 默认 **0 = 关闭**: 已实测纯 tl.dot 就是 64/64 对齐的, 而 ordered 没有 tensor core、
+# 明显更慢, 所以默认全部走 tl.dot。保留该开关纯作对照/调试用
+# (置为一个大数可强制全程走 fp32 精确累加)。
 ORDERED_MAX_M = int(os.getenv("NANOVLLM_GPTQ_ORDERED_MAX_M", "0"))
 
 
