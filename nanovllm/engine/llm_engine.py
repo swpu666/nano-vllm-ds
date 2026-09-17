@@ -73,7 +73,11 @@ class LLMEngine:
         draft token 是"先占位后确认"的, 一旦调整紫部分必须把占位连同跨出去的
         block 一起还回去, 否则 KV cache 会被逐步吃光。
         """
-        G = self.config.num_speculative_tokens
+        # 动态 γ: current_gamma 由 ModelRunner 每轮按"接受率 + draft/target 耗时比"更新。
+        # 注意只取 rank0(主进程) 的那一份 —— worker 不做采样统计, 它的估计值不可信,
+        # 而 γ 必须对所有 rank 一致(实际是从主进程作为参数传下去的)。
+        G = self.model_runner.current_gamma if self.config.dynamic_gamma \
+            else self.config.num_speculative_tokens
         block_manager = self.scheduler.block_manager
 
         # 同一 batch 内 greedy 必须一致 (Speculator 按 batch 处理),
@@ -82,25 +86,29 @@ class LLMEngine:
         if not all(seq.greedy == greedy for seq in seqs):
             return self._step_spec_fallback(seqs, [])
 
-        # 1) 占位 γ 个 draft token 并分配 block
-        # ⚠ 占位 token 会立刻让 num_completion_tokens 虚增 γ, 而 max_tokens 余量必须按
-        #   **本轮开始时**的完成数来算。否则余量会被少算 γ, γ 一旦吃满就会
-        #   出现"每轮确认 0 个 token" -> 序列永远不 finish -> generate() 死循环。
+        # 多候选: 一次 verify 同时验证 K 条候选链, 占位也要 γ*K 个
+        K = self.config.num_spec_candidates
+        num_slots = G * K
+
+        # 1) 占位 draft token 并分配 block
+        # ⚠ 占位 token 会立刻让 num_completion_tokens 虚增 γ*K, 而 max_tokens 余量必须按
+        #   **本轮开始时**的完成数来算。否则余量会被少算, 一旦吃满就会出现
+        #   "每轮确认 0 个 token" -> 序列永远不 finish -> generate() 死循环。
         base_completion = [seq.num_completion_tokens for seq in seqs]
         appended = []
         ok = True
         for seq in seqs:
             # spec 期间保持 is_prefill=True, 让 Sequence.__getstate__ 把完整
-            # token_ids 传给 TP worker (worker 需要尾部 γ 个位置构造 verify 输入)
+            # token_ids 传给 TP worker (worker 需要尾部位置构造 verify 输入)
             seq.is_prefill = True
-            seq.append_spec_tokens([0] * G)
-            ok &= block_manager.may_append_n(seq, G)
+            seq.append_spec_tokens([0] * num_slots)
+            ok &= block_manager.may_append_n(seq, num_slots)
             appended.append(seq)
         if not ok:
             return self._step_spec_fallback(seqs, appended)
 
         # 2) draft γ 步 + target verify + 拒绝采样
-        result = self.model_runner.call("run_spec", seqs, G, greedy)
+        result = self.model_runner.call("run_spec", seqs, G, greedy, K)
 
         # 3) 按接受结果回滚 / 落盘
         total = 0
@@ -116,15 +124,23 @@ class LLMEngine:
                     accepted = accepted[:cut]
 
             if accepted is None:          # worker 不产出采样结果 -> 全部回滚
-                block_manager.trim(seq, G)
+                block_manager.trim(seq, num_slots)
                 seq.num_scheduled_tokens = 0
                 continue
 
             k = result.n_accepted[i]
             m = len(accepted)
-            # 尾部现在有 G 个占位(前 k 个已被覆盖为真 draft token),
-            # 只保留前 min(m, k) 个; 若 m==k+1 还要补 extra token
-            block_manager.trim(seq, G - min(m, k))
+            keep = min(m, k)
+            if K > 1:
+                # 多候选: 占位布局是 [链0 的 γ 个][链1 的 γ 个]..., 被选中的链
+                # 未必是链 0 —— 先把它的 token 搬到序列头部, 再统一 trim
+                L = len(seq) - num_slots
+                c = result.chain_id[i] if result.chain_id else 0
+                for j in range(keep):
+                    seq.token_ids[L + j] = seq.token_ids[L + c * G + j]
+            # 尾部现在有 num_slots 个占位(被选中链的前 k 个已是真 draft token),
+            # 只保留前 keep 个; 若 m==k+1 还要补 extra token
+            block_manager.trim(seq, num_slots - keep)
             if m > k:
                 assert block_manager.can_append(seq), "投机解码追加 token 时 KV 不足"
                 block_manager.may_append(seq)
@@ -150,7 +166,8 @@ class LLMEngine:
     def _step_spec_fallback(self, seqs: list[Sequence], appended: list[Sequence]) -> int:
         """降级路径: 回滚所有占位, 退回普通单步 decode。"""
         for seq in appended:
-            self.scheduler.block_manager.trim(seq, self.config.num_speculative_tokens)
+            self.scheduler.block_manager.trim(
+                seq, self.config.num_speculative_tokens * self.config.num_spec_candidates)
         token_ids = self.model_runner.call("run", seqs, False)
         self.scheduler.postprocess(seqs, token_ids, False)
         return len(seqs)

@@ -10,7 +10,7 @@ from transformers import AutoConfig
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
-from nanovllm.engine.speculator import Speculator
+from nanovllm.engine.speculator import Speculator, VerifyOutput
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -74,6 +74,13 @@ class ModelRunner:
         self.draft_model = None
         self.draft_kv_cache = None
         self.spec_round = 0
+        # 动态 γ: 运行时在 [1, max_gamma] 里挑; current_gamma 由 run_spec 每轮更新
+        self.current_gamma = config.num_speculative_tokens
+        self.max_gamma = max(config.max_speculative_tokens, config.num_speculative_tokens)
+        self.dynamic_gamma = config.dynamic_gamma
+        # 上一轮的计时事件, 下一轮再读 -> 不额外引入同步点
+        self._timing = None
+        self._cost_ratio = 0.0
         if config.draft_model:
             self._init_draft_model(config)
         self.sampler = Sampler()
@@ -334,6 +341,23 @@ class ModelRunner:
         """第 token_idx 个 token 落在 paged KV cache 的哪个 slot。draft/target 共用。"""
         return seq.block_table[token_idx // self.block_size] * self.block_size + token_idx % self.block_size
 
+    def _update_gamma(self, timing, G: int):
+        """用上一轮测到的 draft/verify 耗时更新 c, 并重新选 γ。"""
+        if not self.dynamic_gamma:
+            return
+        if self._timing is not None:
+            e0, e1, e2 = self._timing
+            t_draft = e0.elapsed_time(e1)          # 上一轮 1 次 draft 单步 (纯 GPU)
+            t_verify = e1.elapsed_time(e2)         # 上一轮 1 次 verify       (纯 GPU)
+            if t_verify > 1e-6:
+                cost = t_draft / t_verify          # c = 单步 draft / target 单步
+                self._cost_ratio = cost if self._cost_ratio == 0.0 \
+                    else 0.8 * self._cost_ratio + 0.2 * cost
+        self._timing = timing
+        if self.speculator is not None:
+            self.current_gamma = self.speculator.suggest_gamma(
+                self._cost_ratio, self.max_gamma)
+
     @torch.inference_mode()
     def _draft_forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """draft 模型 forward -> logits (eager)。复用调用方已经 set 好的 context。"""
@@ -407,8 +431,13 @@ class ModelRunner:
         gen.manual_seed(_SPEC_GEN_BASE + self.spec_round * 1024 + step)
         return gen
 
-    def prepare_draft_decode(self, seqs: list[Sequence], i: int, G: int):
-        """draft 的第 i 步 (i = 0..G), 每个 seq 处理第 L-1+i 个 token。
+    def prepare_draft_decode(self, seqs: list[Sequence], i: int, G: int, K: int = 1):
+        """draft 的第 i 步 (i = 0..G)。
+
+        K=1 (链式)   : 每个 seq 处理第 L-1+i 个 token。
+        K>1 (多候选) : 每个 seq 的 K 条候选链**并行**处理, 扁平成 B*K 行;
+                       第 c 条链的第 i 个 token 落在 index L + c*G + i - 1。
+                       i=0 时所有链都从 x_{L-1} 出发(同一个起点, slot 相同)。
 
         i=0     输入已确认的最后一个 token -> 产出 d_1
         i>=1    输入第 i 个草稿 token      -> 产出 d_{i+1}
@@ -418,23 +447,41 @@ class ModelRunner:
         """
         input_ids, positions, slot_mapping, context_lens = [], [], [], []
         for seq in seqs:
-            L = len(seq) - G
-            idx = L - 1 + i
-            input_ids.append(seq[idx])
-            positions.append(idx)
-            context_lens.append(idx + 1)
-            slot_mapping.append(self._slot_of(seq, idx))
+            L = len(seq) - G * K
+            for c in range(K):
+                idx = L - 1 + i                       # 位置(所有链相同)
+                tok_idx = idx if i == 0 else L + c * G + i - 1
+                input_ids.append(seq[tok_idx])
+                positions.append(idx)
+                context_lens.append(idx + 1)
+                slot_mapping.append(self._slot_of(seq, tok_idx))
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        block_tables = self.prepare_block_tables(seqs)
+        block_tables = self._prepare_block_tables_multi(seqs, K)
         # 这里不 set_context: draft 走 CUDA graph, context 只在捕获时用到,
         # replay 时 Python 侧完全不执行。返回值交给 _draft_forward_graph 拷进静态 buffer。
         return input_ids, positions, slot_mapping, context_lens, block_tables
 
-    def prepare_spec_verify(self, seqs: list[Sequence], G: int):
+    def _prepare_block_tables_multi(self, seqs: list[Sequence], K: int):
+        """多候选时 block_table 要按 (seq, chain) 展开成 B*K 行(同一 seq 重复 K 次)。"""
+        if K == 1:
+            return self.prepare_block_tables(seqs)
+        tables = [seq.block_table for seq in seqs for _ in range(K)]
+        max_len = max(len(t) for t in tables)
+        padded = [t + [-1] * (max_len - len(t)) for t in tables]
+        return torch.tensor(padded, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+
+    def prepare_spec_verify(self, seqs: list[Sequence], G: int, K: int = 1):
         """构造 target 的 verify forward。
+
+        K=1  : 每个 seq 一条链, query = [x_{L-1}, d_1, ..., d_G]  共 γ+1 个位置
+        K>1  : 把 K 条候选链当成 B*K 个 varlen "序列" —— 每条链内部仍是链式的,
+               所以注意力掩码可以沿用"query i 看 key ≤ i + cached", 无需树形掩码
+               kernel; 代价是共享的历史前缀会被读 K 次(带宽), 换来的是实现简洁
+               且复用已经验证过的 kernel。真正按祖先掩码共享前缀的 tree attention
+               需要给 kernel 传显式的可见 key 列表, 留作后续。
 
         query = [x_{L-1}, d_1, ..., d_G]  共 γ+1 个位置, 位置编号 L-1 .. L+G-1
         cache = 前 L-1 个 token (之前轮次已经写进去的)
@@ -452,68 +499,126 @@ class ModelRunner:
         cu_seqlens_q, cu_seqlens_k = [0], [0]
         max_seqlen_q = max_seqlen_k = 0
         for seq in seqs:
-            L = len(seq) - G
-            start = L - 1
-            end = start + G + 1
-            input_ids.extend(seq[start:end])
-            positions.extend(range(start, end))
-            slot_mapping.extend(self._slot_of(seq, t) for t in range(start, end))
-            cu_seqlens_q.append(cu_seqlens_q[-1] + end - start)
-            cu_seqlens_k.append(cu_seqlens_k[-1] + end)
-            max_seqlen_q = max(max_seqlen_q, end - start)
-            max_seqlen_k = max(max_seqlen_k, end)
+            L = len(seq) - G * K
+            for c in range(K):
+                # 链的 query: [x_{L-1}] + 该链的 G 个候选 token
+                ids = [seq[L - 1]] + [seq[L + c * G + j] for j in range(G)]
+                slots = [self._slot_of(seq, L - 1)] + \
+                        [self._slot_of(seq, L + c * G + j) for j in range(G)]
+                input_ids.extend(ids)
+                positions.extend(range(L - 1, L + G))
+                slot_mapping.extend(slots)
+                n_q = G + 1
+                cu_seqlens_q.append(cu_seqlens_q[-1] + n_q)
+                cu_seqlens_k.append(cu_seqlens_k[-1] + L - 1 + n_q)   # 含 cached 前缀
+                max_seqlen_q = max(max_seqlen_q, n_q)
+                max_seqlen_k = max(max_seqlen_k, L - 1 + n_q)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        block_tables = self.prepare_block_tables(seqs)
+        block_tables = self._prepare_block_tables_multi(seqs, K)
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                     slot_mapping, None, block_tables, spec_verify=True)
         return input_ids, positions
 
     @torch.inference_mode()
-    def run_spec(self, seqs: list[Sequence], num_spec_tokens: int, greedy: bool):
+    def run_spec(self, seqs: list[Sequence], num_spec_tokens: int, greedy: bool,
+                 num_candidates: int = 1):
         """投机解码一轮: γ 次 draft decode + 1 次 target verify + 拒绝采样。
 
-        前置条件: 调用方(调度层)已把 γ 个占位 token 追加到每个 seq 尾部并分配好 block,
-        这些占位值会在 draft 阶段被真实输出覆盖。
+        num_candidates (K) > 1 时一次 verify 同时验证 K 条候选链, 取接受最长的那条。
+
+        前置条件: 调用方(调度层)已把 γ*K 个占位 token 追加到每个 seq 尾部并分配好
+        block, 这些占位值会在 draft 阶段被真实输出覆盖。
         后置条件: 返回每 seq 本轮确认的 token 列表; **本函数不回收任何 KV block**,
         被拒绝的部分由调度层按返回值调用 BlockManager.trim 回滚。
         """
-        G, B = num_spec_tokens, len(seqs)
+        G, B, K = num_spec_tokens, len(seqs), num_candidates
+        if K > 1 and self.spec_round == 1:
+            print("[spec] ⚠ 多候选 (K>1) 是实验特性: paged KV 的 slot 是逻辑连续语义, "
+                  "多条链共享序列的 slot 区间会让 draft 读到错乱的上下文,"
+                  " 且在 c≈0.07 的配置下实测吞吐更低。详见 docs/spec-decoding.md。")
         self.spec_round += 1
         temperatures = self.prepare_sample(seqs)
+        if K > 1:
+            # 每条候选链对应一行 -> 温度按 (seq, chain) 展开
+            temperatures = temperatures.repeat_interleave(K)
+        # 计时用 CUDA event, 但读的是**上一轮**的事件 —— 那时它早就完成了,
+        # 所以不会在这里插入同步。用于估计 c = t_draft_step / t_target_step。
+        # 计时只测**纯 GPU 时间**, 且每 16 轮才测一次:
+        # draft 循环里每步都有 tok.tolist() (GPU->CPU 同步), 若把 CPU 侧时间也算进
+        # draft, c 会被高估 2~3 倍, 控制器就会把 γ 压得过小 —— 实测这条让
+        # 单请求 decode 从 100 掉到 74。
+        use_timing = self.dynamic_gamma and self.rank == 0
+        timing = None
 
         draft_logits_per_step, draft_tokens_per_step = [], []
         for i in range(G + 1):
-            input_ids, positions, sm, cl, bt = self.prepare_draft_decode(seqs, i, G)
-            logits = self._draft_forward_graph(input_ids, positions, sm, cl, bt)   # (B, Vd)
+            input_ids, positions, sm, cl, bt = self.prepare_draft_decode(seqs, i, G, K)
+            logits = self._draft_forward_graph(input_ids, positions, sm, cl, bt)   # (B*K, Vd)
             if i == G:
                 break          # 第 G 步只写 KV, 输出丢弃 (见 prepare_draft_decode 注释)
             tok = self.speculator.draft_step(logits, temperatures, greedy,
-                                             self._make_generator(i))
+                                             self._make_generator(i), step=i, K=K)
             # 一次 tolist 而不是逐个 int(): 每个 token 一次 GPU->CPU 同步太贵
             toks = tok.tolist()
-            # 覆盖占位值: 第 i 个草稿 token 位于 index L+i
+            # 覆盖占位值: 链 c 的第 i 个草稿 token 位于 index L + c*G + i
             for b, seq in enumerate(seqs):
-                seq.token_ids[len(seq) - G + i] = toks[b]
+                L = len(seq) - G * K
+                for c in range(K):
+                    seq.token_ids[L + c * G + i] = toks[b * K + c]
             draft_logits_per_step.append(logits)
             draft_tokens_per_step.append(tok)
+            last_inputs = (input_ids, positions, sm, cl, bt)
 
-        input_ids, positions = self.prepare_spec_verify(seqs, G)
-        target_logits = self.model.compute_logits(self.model(input_ids, positions))   # (B*(G+1), Vt)
+        # 纯 GPU 计时段: 一次额外的 draft replay + 正式的那次 verify forward。
+        # 额外的 replay 写的是同样的 slot、值也相同, 对结果无影响。
+        if use_timing and self.spec_round % 16 == 1:
+            timing = tuple(torch.cuda.Event(enable_timing=True) for _ in range(3))
+            timing[0].record()
+            self._draft_forward_graph(*last_inputs)
+            timing[1].record()
+
+        input_ids, positions = self.prepare_spec_verify(seqs, G, K)
+        target_logits = self.model.compute_logits(self.model(input_ids, positions))   # (B*K*(G+1), Vt)
+        if timing:
+            timing[2].record()
         reset_context()
+        self._update_gamma(timing, G)
 
         result = None
         if self.rank == 0:
-            draft_logits = torch.stack(draft_logits_per_step, dim=1)                  # (B, G, Vd)
-            draft_tokens = torch.stack(draft_tokens_per_step, dim=1)                  # (B, G)
-            target_logits = target_logits.view(B, G + 1, -1)                          # (B, G+1, Vt)
+            # 按 (seq, chain) 展平成 B*K 行做拒绝采样, 每条链独立
+            draft_logits = torch.stack(draft_logits_per_step, dim=1)                  # (B*K, G, Vd)
+            draft_tokens = torch.stack(draft_tokens_per_step, dim=1)                  # (B*K, G)
+            target_logits = target_logits.view(B * K, G + 1, -1)                      # (B*K, G+1, Vt)
             result = self.speculator.verify(
                 target_logits, draft_logits, draft_tokens, temperatures, greedy,
                 self._make_generator(G))
+            if K > 1:
+                result = self._pick_best_candidate(result, B, K)
         return result
+
+    @staticmethod
+    def _pick_best_candidate(result: VerifyOutput, B: int, K: int) -> VerifyOutput:
+        """从 K 条候选链里取接受最长的那条。
+
+        greedy 下这个选择**不改变输出**: 被接受的 token 必然等于 target 的 argmax,
+        取最长只是拿到更多个本来就已确定的 token。
+        采样下"取最长"是贪心近似 —— 相比单链会略微偏向接受长度高的链
+        (严格的 tree sampling 需要在树上做递归采样, 留作后续)。
+        """
+        tokens, nacc, chains = [], [], []
+        for b in range(B):
+            cands = result.accepted_tokens[b * K:(b + 1) * K]
+            best = max(range(K), key=lambda c: len(cands[c]))
+            tokens.append(cands[best])
+            nacc.append(result.n_accepted[b * K + best])
+            chains.append(best)
+        return VerifyOutput(n_accepted=nacc, accepted_tokens=tokens,
+                            n_new_tokens=[len(t) for t in tokens], chain_id=chains)
 
     @torch.inference_mode()
     def capture_cudagraph(self):

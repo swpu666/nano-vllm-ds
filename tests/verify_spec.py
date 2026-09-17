@@ -152,10 +152,10 @@ def part_b(verbose: bool = True):
 
 
 # ============================================================ Part C: 端到端
-def _run_child(mode: str, gamma: int, max_tokens: int, target: str, draft: str):
+def _run_child(mode: str, gamma: int, max_tokens: int, target: str, draft: str, K: int = 1):
     import json
     cmd = [sys.executable, __file__, "--mode", "gen", "--gamma", str(gamma),
-           "--max_tokens", str(max_tokens), "--target", target]
+           "--max_tokens", str(max_tokens), "--target", target, "--candidates", str(K)]
     if draft:
         cmd += ["--draft", draft]
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -173,10 +173,10 @@ def _run_child(mode: str, gamma: int, max_tokens: int, target: str, draft: str):
     return result, stats
 
 
-def part_c(target: str, draft: str, gamma: int, max_tokens: int):
+def part_c(target: str, draft: str, gamma: int, max_tokens: int, K: int = 1):
     print("\n=== Part C: 端到端 greedy 对齐 (model loading, 每个子进程独立) ===")
     base_result, _ = _run_child("baseline", 0, max_tokens, target, None)
-    spec_result, spec_stats = _run_child("spec", gamma, max_tokens, target, draft)
+    spec_result, spec_stats = _run_child("spec", gamma, max_tokens, target, draft, K)
     print()
     if base_result is None or spec_result is None:
         return False
@@ -204,13 +204,15 @@ def part_c(target: str, draft: str, gamma: int, max_tokens: int):
 
 
 # ================================================================ 子进程模式
-def mode_gen(target: str, draft: str | None, gamma: int, max_tokens: int):
+def mode_gen(target: str, draft: str | None, gamma: int, max_tokens: int, K: int = 1,
+             dynamic: bool = True):
     from nanovllm.llm import LLM
     from nanovllm.sampling_params import SamplingParams
     kwargs = dict(tensor_parallel_size=1, enforce_eager=True,
                   max_num_seqs=len(PROMPTS), max_model_len=2048, max_num_batched_tokens=8192)
     if draft:
-        kwargs.update(draft_model=draft, num_speculative_tokens=gamma)
+        kwargs.update(draft_model=draft, num_speculative_tokens=gamma,
+                      num_spec_candidates=K, dynamic_gamma=dynamic)
     llm = LLM(target, **kwargs)
     sp = SamplingParams(greedy=True, max_tokens=max_tokens, ignore_eos=False)
     outs = llm.generate(PROMPTS, sp, use_tqdm=False)
@@ -244,6 +246,9 @@ def main():
     # 默认必须为 None: 不给 --draft 就代表"跑不带投机解码的基线"
     ap.add_argument("--draft", default=None)
     ap.add_argument("--gamma", type=int, default=4)
+    ap.add_argument("--candidates", type=int, default=1,
+                    help="K: 一次 verify 同时验证的候选链数 (tree verification)")
+    ap.add_argument("--dynamic", type=int, default=1)
     ap.add_argument("--max_tokens", type=int, default=64)
     ap.add_argument("--e2e", action="store_true")
     args = ap.parse_args()
@@ -261,7 +266,7 @@ def main():
     if args.e2e:
         # --draft 默认是 None (不带 draft == 跑基线), e2e 需要显式给出 draft 路径
         draft = args.draft or DEFAULT_DRAFT
-        ok &= part_c(args.target, draft, args.gamma, args.max_tokens)
+        ok &= part_c(args.target, draft, args.gamma, args.max_tokens, args.candidates)
 
     print("\n" + ("=" * 60))
     print("总结:", "✅ 全部通过" if ok else "❌ 存在失败项")

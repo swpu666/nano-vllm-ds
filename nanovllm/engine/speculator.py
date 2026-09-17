@@ -73,6 +73,8 @@ class VerifyOutput:
     n_accepted: list[int]
     accepted_tokens: list[list[int]]
     n_new_tokens: list[int]
+    # 多候选 (K>1) 时被选中的那条链的编号, 调度层据此把它的 token 搬到序列头部
+    chain_id: list[int] = field(default_factory=list)
 
 
 class Speculator:
@@ -85,16 +87,40 @@ class Speculator:
         self.num_accepted_tokens = 0
         self.num_draft_tokens = 0
         self.num_rounds = 0
+        # 动态 γ: 每个 γ 实测到的"每轮确认 token 数"的 EMA。
+        # 用实测值而不是几何模型, 是因为接受率随候选位置下降 —— 恒定 α 的
+        # (1-α^(γ+1))/(1-α) 会系统性高估长链, 实测中把 γ 从 7 推到 8 反而变慢。
+        self.gamma_mean_acc: dict[int, float] = {}
+        self.gamma_obs: dict[int, int] = {}
+        self._last_gamma: int = num_spec_tokens
 
     # ---------------------------------------------------------------- draft
     def draft_step(
         self,
-        draft_logits: torch.Tensor,           # (B, Vd)
+        draft_logits: torch.Tensor,           # (B*K, Vd)
         temperatures: Optional[torch.Tensor],
         greedy: bool,
         generator: Optional[torch.Generator] = None,
+        step: int = 0,
+        K: int = 1,
     ) -> torch.Tensor:
-        """draft 模型单步采样, 返回 (B,) 候选 token。"""
+        """draft 模型单步采样, 返回 (B*K,) 候选 token。
+
+        K>1 时第 0 步按 draft 分布的 **top-K 分叉**, 而不是独立采样 K 次:
+        同一 draft 分布在温度不高时 top-1 占主导, 独立采样的 K 条链会在第一个
+        token 就高度重合 —— 实测 K=2 独立采样的平均接受长度反而低于 K=1
+        (5.95 vs 6.19), 白付了 K 倍的 draft/verify 成本。
+
+        分叉后每条链的后续 token 各自独立采样, 于是 K 条链在第一个位置就必然不同。
+        注意这**不破坏**拒绝采样的正确性: 判据只要求 draft token 来自某个已知分布
+        q, 确定性地取 top-k 同样是"已知分布"上的一个事件, q(d) 照算即可。
+        """
+        if K > 1 and step == 0:
+            # 行按 (seq, chain) 排列, 步长 K 取到每个 seq 的第一行
+            base = draft_logits[::K]                                  # (B, Vd)
+            k = min(K, base.size(-1))
+            # (B, K) 按行展平 -> [seq0_chain0, seq0_chain1, seq1_chain0, ...]
+            return base.topk(k, dim=-1).indices.reshape(-1)
         if greedy:
             return draft_logits.argmax(dim=-1)
         return _gumbel_sample(_probs(draft_logits, temperatures), generator)
@@ -110,7 +136,8 @@ class Speculator:
         generator: Optional[torch.Generator] = None,
     ) -> VerifyOutput:
         B, G = draft_tokens.shape
-        assert G == self.num_spec_tokens, (G, self.num_spec_tokens)
+        # 不要求 G == num_spec_tokens: 开启动态 γ 后每轮的 γ 都可能不同
+        assert G >= 1
         assert target_logits.shape[:2] == (B, G + 1)
 
         V = min(target_logits.size(-1), draft_logits.size(-1))
@@ -137,6 +164,12 @@ class Speculator:
         self.num_accepted_tokens += int(n_accepted.sum())
         self.num_draft_tokens += B * G
         self.num_rounds += B
+        # 本轮每序列确认的 token 数(含 bonus) -> 该 γ 的实测收益
+        acc_per_round = sum(len(t) for t in accepted_tokens) / B
+        prev = self.gamma_mean_acc.get(G, acc_per_round)
+        self.gamma_mean_acc[G] = 0.8 * prev + 0.2 * acc_per_round
+        self.gamma_obs[G] = self.gamma_obs.get(G, 0) + 1
+        self._last_gamma = G
         return VerifyOutput(
             n_accepted=n_accepted.tolist(),
             accepted_tokens=accepted_tokens,
@@ -214,6 +247,47 @@ class Speculator:
         return p_all[:, G, :]
 
     # ------------------------------------------------------------- metrics
+    def suggest_gamma(self, cost_ratio: float, max_gamma: int, min_gamma: int = 1) -> int:
+        """按当前接受率与「draft/target 单步耗时比」选期望收益最大的 γ。
+
+        为什么需要动态 γ: 接受率 α 随负载、prompt 分布、并发数漂移很快 —— α 高时
+        小 γ 浪费了"多验证几个也不亏"的机会, α 低时大 γ 只是在给 draft 白烧时间。
+        固定 γ 只能在某一个工作点上最优。
+
+        延迟模型(Leviathan et al. 2023 同款一阶近似):
+            E[每轮确认 token 数] = (1 − α^(γ+1)) / (1 − α)      # 几何近似
+            E[每轮耗时(以 target 单步为单位)] = 1 + γ·c          # 1 次 verify + γ+1 次 draft
+            → 取 γ* = argmax (1 − α^(γ+1)) / ((1 − α)(1 + γ·c))
+        c = t_draft_step / t_target_step, 由 ModelRunner 在线测量。
+        """
+        a = min(max(self.acceptance_rate, 1e-3), 0.999)
+        if self.num_rounds < 4:          # 统计不足时先用配置值, 别乱跳
+            return self._last_gamma
+        lo, hi = min_gamma, max(max_gamma, min_gamma)
+
+        def _mean_acc(g: int) -> float:
+            obs = self.gamma_obs.get(g, 0)
+            if obs >= 3:                                   # 测过足够的轮次
+                return self.gamma_mean_acc[g]
+            geom = (1.0 - a ** (g + 1)) / (1.0 - a)        # 没测过就用几何模型兜底
+            if g in self.gamma_mean_acc:                   # 测过一点: 与实测混合
+                w = obs / 3.0
+                return w * self.gamma_mean_acc[g] + (1 - w) * geom
+            return geom
+
+        def _score(g: int) -> float:
+            return _mean_acc(g) / (1.0 + g * cost_ratio)
+
+        best_g, best = self._last_gamma, _score(self._last_gamma)
+        for g in range(lo, hi + 1):
+            s = _score(g)
+            if s > best:
+                best, best_g = s, g
+        # 切换滞后: 新 γ 必须明显更优(>10%)才切, 否则在阈值附近反复横跳,
+        # 每次切换都会打断 EMA 统计, 反而测不准
+        if best_g != self._last_gamma and best < _score(self._last_gamma) * 1.10:
+            return self._last_gamma
+        return best_g
     @property
     def acceptance_rate(self) -> float:
         return self.num_accepted_tokens / self.num_draft_tokens if self.num_draft_tokens else 0.0

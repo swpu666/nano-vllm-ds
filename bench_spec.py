@@ -34,7 +34,7 @@ PROMPTS = [
 ]
 
 # nano-vLLM 原本不支持 greedy; 用很小的 temperature 近似确定性采样
-TEMPERATURE = 0.8
+TEMPERATURE = 0.8   # 可用 --temperature 覆盖
 
 
 def _avg(xs):
@@ -52,10 +52,10 @@ def _weights_gib(llm) -> float:
     return total / 2 ** 30
 
 
-def _check_kv_leak(llm, is_prefill_free=None):
+def _check_kv_leak(llm, temperature=TEMPERATURE):
     """跑三轮生成, 结束后空闲 block 数必须回到起点, 否则 block 回收有 bug。"""
     from nanovllm.sampling_params import SamplingParams
-    sp = SamplingParams(temperature=TEMPERATURE, max_tokens=48)
+    sp = SamplingParams(temperature=temperature, max_tokens=48)
     bm = llm.scheduler.block_manager
     llm.generate(["warm-up prompt for kv cache account"], sp, use_tqdm=False)
     free0 = len(bm.free_block_ids)
@@ -65,7 +65,9 @@ def _check_kv_leak(llm, is_prefill_free=None):
     return free0, free1
 
 
-def bench_one(target: str, draft: str | None, gamma: int, max_tokens: int):
+def bench_one(target: str, draft: str | None, gamma: int, max_tokens: int,
+              dynamic: bool = True, max_gamma: int = 12, K: int = 1,
+              temperature: float = TEMPERATURE):
     from nanovllm.llm import LLM
     from nanovllm.sampling_params import SamplingParams
 
@@ -74,9 +76,11 @@ def bench_one(target: str, draft: str | None, gamma: int, max_tokens: int):
                   max_num_batched_tokens=8192)
     gamma = 0 if draft is None else gamma
     if draft is not None:
-        kwargs.update(draft_model=draft, num_speculative_tokens=gamma)
+        kwargs.update(draft_model=draft, num_speculative_tokens=gamma,
+                      dynamic_gamma=dynamic, max_speculative_tokens=max_gamma,
+                      num_spec_candidates=K)
     llm = LLM(target, **kwargs)
-    sp = SamplingParams(temperature=TEMPERATURE, max_tokens=max_tokens)
+    sp = SamplingParams(temperature=temperature, max_tokens=max_tokens)
     llm.generate(["warm-up prompt"], sp, use_tqdm=False)
 
     # ---- TTFT + 单请求 decode ----
@@ -105,8 +109,10 @@ def bench_one(target: str, draft: str | None, gamma: int, max_tokens: int):
     if draft is not None:
         spec = llm.model_runner.speculator
         stats = {"alpha": spec.acceptance_rate, "mean_acc": spec.mean_accepted_length,
-                 "tail_mass": spec.tail_mass.mean}
-        free0, free1 = _check_kv_leak(llm)
+                 "tail_mass": spec.tail_mass.mean,
+                 "gamma_final": llm.model_runner.current_gamma,
+                 "cost_ratio": llm.model_runner._cost_ratio}
+        free0, free1 = _check_kv_leak(llm, temperature)
         stats["kv_leak"] = free0 != free1
         stats["free_blocks"] = f"{free1}/{free0}"
 
@@ -122,9 +128,11 @@ def bench_one(target: str, draft: str | None, gamma: int, max_tokens: int):
     return result
 
 
-def _run_child(target, draft, gamma, max_tokens):
+def _run_child(target, draft, gamma, max_tokens, dynamic, max_gamma, K, temp):
     cmd = [sys.executable, __file__, "--mode", "single", "--gamma", str(gamma),
-           "--max_tokens", str(max_tokens), "--target", target, "--json"]
+           "--max_tokens", str(max_tokens), "--target", target, "--json",
+           "--dynamic", str(int(dynamic)), "--max-gamma", str(max_gamma),
+           "--candidates", str(K), "--temperature", str(temp)]
     if draft:
         cmd += ["--draft", draft]
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -143,6 +151,12 @@ def main():
     ap.add_argument("--target", default=DEFAULT_TARGET)
     ap.add_argument("--draft", default=None)
     ap.add_argument("--gammas", default="0,3,5,7")
+    ap.add_argument("--dynamic", type=int, default=1,
+                    help="1=按接受率与耗时比在线选 γ; 0=固定用 --gammas 给的 γ")
+    ap.add_argument("--max-gamma", type=int, default=12)
+    ap.add_argument("--candidates", type=int, default=1,
+                    help="K: 一次 verify 同时验证的候选链数 (tree verification)")
+    ap.add_argument("--temperature", type=float, default=TEMPERATURE)
     ap.add_argument("--max_tokens", type=int, default=128)
     ap.add_argument("--mode", default="parent", choices=["parent", "single"])
     ap.add_argument("--gamma", type=int, default=0)
@@ -151,7 +165,9 @@ def main():
 
     if args.mode == "single":
         draft = None if args.gamma == 0 else (args.draft or DEFAULT_DRAFT)
-        r = bench_one(args.target, draft, args.gamma, args.max_tokens)
+        r = bench_one(args.target, draft, args.gamma, args.max_tokens,
+                      dynamic=bool(args.dynamic), max_gamma=args.max_gamma,
+                      K=args.candidates)
         print("JSON_RESULT " + json.dumps(r))
         return
 
@@ -159,13 +175,17 @@ def main():
     rows = []
     for g in [int(x) for x in args.gammas.split(",")]:
         print(f"########## γ={g} ({'基线' if g == 0 else '投机解码'}) ##########")
-        r = _run_child(args.target, draft, g, args.max_tokens)
+        r = _run_child(args.target, draft, g, args.max_tokens,
+                       bool(args.dynamic), args.max_gamma, args.candidates,
+                       args.temperature)
         if r:
             rows.append(r)
             extra = ""
             if g > 0:
                 leak = "❌ 泄漏" if r.get("kv_leak") else "✅ 无泄漏"
-                extra = (f"\n  接受率 alpha : {r['alpha']:.3f}   平均接受长度: {r['mean_acc']:.2f}"
+                ginfo = f"  收敛 γ={r.get('gamma_final')}  c={r.get('cost_ratio', 0):.3f}" \
+                    if r.get("gamma_final") is not None else ""
+                extra = (f"\n  接受率 alpha : {r['alpha']:.3f}   平均接受长度: {r['mean_acc']:.2f}{ginfo}"
                          f"\n  KV block 回收: {leak} (空闲 {r.get('free_blocks', '-')})")
             print(f"  TTFT        : {r['ttft']:.1f} ms"
                   f"\n  Decode      : {r['decode']:.1f} tok/s (单请求)"

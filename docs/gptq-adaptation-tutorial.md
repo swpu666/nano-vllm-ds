@@ -584,6 +584,8 @@ $PY tests/profile_spec.py 5
 - **自研 Triton paged-KV attention kernel（causal 前缀 + flash-decoding 分段并行）**：kernel 内**直接按 `block_table` 从 paged cache 取 K/V**（不物化成连续内存），前缀段与本次新增段分两段走 online softmax 合并，掩码按「query i 可看 key ≤ i + cached_len」构造；每个 program 处理一个 (query 行, head)，并沿 key 维切成 N_SPLITS 段并行后二次归约（decode 时 batch 小，否则填不满 82 个 SM）。替换掉原 sdpa fallback 后，引擎基线本身的 4 并发吞吐 77.4 → 111.6 tok/s。
 - **draft 单步 forward 的 CUDA Graph 化（profiler 定位 launch-bound）**：0.5B draft 一次 forward 里 GPU 只算 2.7 ms、墙钟 20 ms（约 600 次 kernel launch），γ+1 次 draft 的 launch 开销会把投机收益全部吃掉（未 graph 化时加速比仅 **0.70×**）；按 batch size 缓存 CUDA graph、把权重/lm_head/attention 全部固化后，单步 **20.7 → 2.77 ms**，端到端加速比 0.70× → **3.96×**。
 - **投机解码的正确性验证（强证据 + 词表不等长处理）**：以「不开投机」的同引擎输出为 ground truth，greedy 下 4 条 prompt **逐 token 相同**；采样模式下用拒绝采样保证输出分布不变（首 token 分布 TVD 0.006、bonus 分布 TVD 0.011），并注入 4 种实现错误（漏除 q、残差分布用 p / 用 q、bonus 取错位置）验证检验**逐个都能抓住**。draft/target 词表不等长（151936 vs 152064）时把概率空间截断到公共前缀后重归一化，被丢弃的尾部概率质量 7.8e-9。
+- **动态 γ（按延迟模型在线选 draft 长度）**：固定 γ 只在一个工作点最优。在线测出 draft/target 单步耗时比 c（本配置 ≈0.07），用 `γ* = argmax (1−α^(γ+1))/((1−α)(1+γ·c))` 选长度，并用**每个 γ 的实测接受长度**（而非几何模型）+ 10% 切换滞后抑制抖动；4 并发吞吐 289.3 → **294.0**，换 draft/硬件导致 c 变化时无需重新调参（c 从 0.07 升到 0.3 时最优 γ 会从 7 降到 2）。
+- **多候选（tree）验证：一次 forward 验证 K 条候选链**：draft 第 0 步按分布 **top-K 分叉**（独立采样的 K 条链会重合，实测接受长度反而更低），verify 把 K 条链展平成 B×K 个 varlen 序列一次算完，取接受最长的那条；greedy 下 K=2 仍与基线**逐 token 相同**。实测在本配置下 K>1 不划算并已定位两个原因（见口头展开 ⑩），故默认关闭。
 
 ## 口头展开（面试追问时讲，不写进简历正文）
 
@@ -657,18 +659,19 @@ $PY tests/profile_spec.py 5
 
 ## 投机解码指标（放简历"成绩"栏）
 
-| 指标 | γ=0（同引擎基线） | **γ=5** | **γ=7** |
-|---|---|---|---|
-| 单请求 decode (tok/s) | 30.1 | 101.6 | **118.9（3.96×）** |
-| 4 并发吞吐 (tok/s) | 113.6 | **222.8（1.96×）** | 220.8 |
-| TTFT (ms) | 35.0 | 58.3 | 56.3 |
-| 接受率 α | — | 0.560 | 0.482 |
-| 平均每轮确认 token | 1.00 | 3.80 | 4.37 |
-| greedy 输出逐 token 一致 | — | **4/4** | — |
-| 权重显存 (GiB) | 5.20 | 6.39 | 6.39 |
+| 指标 | γ=0（同引擎基线） | **γ=5** | **γ=7** | **γ=7 + 动态 γ** |
+|---|---|---|---|---|
+| 单请求 decode (tok/s) | 32.6 | 101.5 | **118.5（3.64×）** | **119.1** |
+| 4 并发吞吐 (tok/s) | 121.1 | 225.4 | **289.3（2.39×）** | **294.0** |
+| TTFT (ms) | 34.9 | 56.6 | 57.8 | 56.5 |
+| 接受率 α | — | — | 0.741 | — |
+| 平均每轮确认 token | 1.00 | — | 6.19 | — |
+| greedy 输出逐 token 一致 | — | — | **4/4** | **4/4** |
+| 权重显存 (GiB) | 5.20 | 6.39 | 6.39 | 6.39 |
 
-> γ=0 基线是**同一个引擎**关掉投机解码的实测值（113.6 tok/s），高于 §6 的 77.4 —— 因为本模块顺带把 decode attention 从 sdpa fallback 换成了自研 Triton flash-decoding kernel（见口头展开 ⑦）。两个数字口径不同，不要混用：76.7/77.4 是「vs 未量化上游引擎」的同口径对照，113.6 是「本引擎 γ=0」的对照。
-> TTFT 从 35 → 56 ms 是已知代价：prefill 时必须顺便把 prompt 的 KV 也写进 draft cache，否则第一轮 draft decode 会读到未初始化的显存。
+> γ=0 基线是**同一个引擎**关掉投机解码的实测值（121.1 tok/s），高于 §6 的 77.4 —— 一是本模块顺带重写了 decode attention（自研 Triton flash-decoding kernel），二是后来装上了 flash-attn。**三个口径的基线都不同，不要混用**：76.7/77.4 = vs 未量化上游引擎；113.6 = 本引擎 γ=0 且未装 flash-attn；121.1 = 本引擎 γ=0 且已装 flash-attn（当前口径）。
+> TTFT 从 35 → 57 ms 是已知代价：prefill 时必须顺便把 prompt 的 KV 也写进 draft cache，否则第一轮 draft decode 会读到未初始化的显存。
+> 装上 flash-attn 后接受率从 0.48~0.56 跳到 0.74~0.90 —— 之前自研的 decode attention kernel 存在细微精度损失拖低了 draft 质量，这也说明 fallback 实现很难达到 flash-attn 的数值质量。
 
 ## 技术栈 / 关键词
 
@@ -705,7 +708,17 @@ PyTorch、Triton、GPTQ、weight-only quantization、int4、group-wise dequant�
 - **为什么不用 EAGLE / Medusa？** 它们要用目标模型的隐藏层监督训练 draft head，成本更高且需要训练数据/算力；draft-model 方案只要挑一个同 tokenizer 的小模型即可，且 Qwen2.5-0.5B 与 7B 同系列同词表（公共区间逐条一致），是零成本可验证的起点。
 - **投机解码会让输出分布改变吗？** 不会 —— 这正是拒绝采样保证的（被拒时从 `(p−q)₊` 重采样，接受判据是 `r < p(x)/q(x)`）。我们用 40 万样本统计确认首 token 分布与 target 的 TVD 只有 0.006，并用变异测试证明这个检验真有判别力。
 - **词表长度不一样怎么办？** 0.5B 是 151936、7B 是 152064。先证明两边 tokenizer 在公共 id 区间上逐条一致，再把概率空间截断到公共前缀重归一化（被丢弃的尾部质量 7.8e-9）。顺带这个约束也保证 draft 输出的 id 必然 < 公共长度，不会让 target 的 embedding 越界。
-- **投机解码的下一步？** ① **tree verification**：一次 target forward 同时验证多条候选（需自写 tree-masked attention kernel），把接受长度从「链的期望」提到「树的期望」；② 动态 γ；③ target 侧 CUDA Graph。
+- **动态 γ 到底调得准不准？** 有两个必须做对的细节：① 计时只测**纯 GPU 时间** —— draft 循环里每步 `tolist()` 都会同步，把 CPU 时间算进去会让 c 高估 2~3 倍、γ 被压小（实测单请求 decode 从 100 掉到 74）；② 用**实测的 γ→接受长度表**而不是恒定 α 的几何模型 —— 接受率随候选位置下降，几何模型会高估长链，实测它把 γ 从 7 推到 8 反而变慢。
+
+**⑩ 多候选（tree）验证：实现过了，但当前配置下不划算**（对应 bullet 11）
+- **做了什么**：draft 第 0 步按 draft 分布的 **top-K 分叉**（不是独立采样 K 次 —— 同分布下独立采样的 K 条链会在第一个 token 就重合，实测 K=2 接受长度 5.95 反而低于 K=1 的 6.19）；verify 把 K 条链当成 B×K 个 varlen 序列一次算完，取接受最长的那条。greedy 下 K=2 仍与基线**逐 token 相同（4/4）**。
+- **问题一（实现层面）**：**paged KV 的 slot 是「逻辑连续」语义**。draft decode 用 `cache_seqlens=L+i` 读的是逻辑位置 `L+i−1` 的 slot，而多候选时链 c 的节点写在 `L+c*G+i−1` —— 对不上，链 c 会读到别的链（或未初始化）的内容，接受率因此从 0.743 掉到 0.577。
+  注意这**不破坏 greedy 正确性**（被接受的 token 一定等于 target argmax，候选质量只影响接受率），所以光看"输出对不对"发现不了 —— 必须盯接受率。正确做法是每条链分配独立 block 并构造虚拟 `block_table`（`seq.block_table[:⌈L/256⌉] + [chain_block]`）。
+- **问题二（收益层面）**：本配置 `c ≈ 0.07`，一轮成本 ≈ `1 + γ·c`，**主要花在 target 的 verify 上**，而 K 翻倍会直接把 verify 的计算量翻倍；同时单链在 α 0.74~0.9 时已接近接受上限（mean_acc 6.19 / 上限 8）。两边一挤，K>1 就是亏的：γ=7 时 K=1 吞吐 289.3，K=2（top-K 分叉）277.4，K=2（独立采样）207.9。
+- **什么时候值得做**：① 接受率**中等**（0.3~0.6）—— 单链频繁早拒才有多候选的价值，α 已经 0.9 时再加候选只是浪费；② verify 的增量成本要低 —— target 相对 draft 越贵越不划算（本项目 7B vs 0.5B 正好相反）；③ 要真正共享前缀还得给 kernel 传**显式的祖先 key 列表**（当前是按链组织、前缀被读 K 次）。
+- **投机解码的下一步？** ① 给多候选补上独立 block + 虚拟 block_table，并在**接受率较低的任务**上重测；② 真正的 tree attention kernel（显式祖先掩码，共享前缀只读一次）；③ target 侧 CUDA Graph（draft 侧已验证可行）。
+
+> 把"做了但实测不划算"的方向连同原因一起讲清楚，比只讲成功的部分更能体现判断力 —— 面试官追问"你为什么不继续做 tree"时会用得上。
 - **GPTQ-v2 / AWQ / GGUF 怎么扩展？** 三者的差异主要在打包格式与反量化公式；架构上只需新增 `unpack` / `dequant` 实现与 loader 映射 —— 本实现已按可插拔 `dequant` 组织。
 
 ---
@@ -730,8 +743,8 @@ PyTorch、Triton、GPTQ、weight-only quantization、int4、group-wise dequant�
 
 | 文件 | 作用 |
 |---|---|
-| `nanovllm/engine/speculator.py` | 拒绝采样 / greedy 验证 / bonus token / 接受率统计（纯张量，可独立测） |
-| `nanovllm/engine/model_runner.py` | draft 模型与双 KV pool、`prepare_draft_decode` / `prepare_spec_verify`、`run_spec`、draft CUDA graph |
+| `nanovllm/engine/speculator.py` | 拒绝采样 / greedy 验证 / bonus token / 接受率统计 / **动态 γ**（纯张量，可独立测） |
+| `nanovllm/engine/model_runner.py` | draft 模型与双 KV pool、`prepare_draft_decode` / `prepare_spec_verify`、`run_spec`、draft CUDA graph、多候选展开、draft/verify 耗时测量 |
 | `nanovllm/engine/llm_engine.py` | step 分支：占位 / 回滚 / `max_tokens` 与 EOS 收尾 / 降级路径 |
 | `nanovllm/engine/block_manager.py` | `may_append_n`（批量占位）+ `trim`（回滚并回收跨出的 block） |
 | `nanovllm/engine/sequence.py` | `append_spec_tokens` / `pop_tokens` |

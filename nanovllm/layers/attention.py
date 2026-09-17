@@ -240,15 +240,20 @@ class Attention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
 
-    def _sdpa_prefill(self, q, k, v):
-        """prefill attention。
+    def _prefill_attention(self, q, k, v):
+        """prefill attention 的分派入口。
 
         ⚠ 这里必须处理"部分 KV 落在 paged cache"的情形:
            本次的 k/v 只是序列的后半段, 前半段要按 block_table 从 cache 里取。
-           flash-attn 原生支持这件事 (vLLM 的 prefix caching 就走这条路); 没有 flash-attn
-           时原先的 sdpa fallback 完全忽略 block_table, 于是任何依赖它的调用
-           (chunked prefill 的续段、投机解码的 verify) 都会丢掉历史上下文。
-           这里用 cached_causal_attn_kernel 补上这部分。
+           依赖这条路径的有: chunked prefill 的续段、投机解码的 verify、tree verify。
+
+        ⚠ 为什么这条路径不能交给 flash-attn: 实测 flash_attn 2.8.3 的
+           flash_attn_varlen_func 只要传了 block_table 就 core dump (各种
+           cu_seqlens_k / max_seqlen_k 组合都试过, 无异常抛出、直接段错误)。
+           所以:
+             - cached == 0 且是标准 causal -> flash-attn varlen (最快)
+             - cached > 0 / 需要树形掩码    -> 自研 cached_causal_attn_kernel
+           后者还有个附加好处: 树形掩码 flash-attn 的 varlen 接口根本表达不了。
         """
         context = get_context()
         cu_q, cu_k = context.cu_seqlens_q, context.cu_seqlens_k
@@ -268,8 +273,12 @@ class Attention(nn.Module):
         if any(c > 0 for c in cached_list):
             return self._prefill_with_cache(q, k, v, block_tables, cu_q_list, cached_list)
 
-        # cached == 0: 本次 k/v 就是全部历史, seqlen_q == seqlen_k, sdpa 的
-        # is_causal 语义恰好正确, 直接走原生实现
+        # cached == 0: 本次 k/v 就是全部历史, seqlen_q == seqlen_k, 是标准的
+        # causal prefill —— 不需要 block_table, flash-attn 可以用且最快
+        if _HAS_FLASH:
+            return flash_attn_varlen_func(
+                q, k, v, cu_q, cu_k, context.max_seqlen_q, context.max_seqlen_k,
+                softmax_scale=self.scale, causal=True)
         outs = []
         for i in range(len(cu_q_list) - 1):
             s, e = cu_q_list[i], cu_q_list[i + 1]
@@ -410,14 +419,13 @@ class Attention(nn.Module):
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
-            # prefill 使用本次计算的 k/v (不读 paged cache)
-            if _HAS_FLASH:
-                return flash_attn_varlen_func(
-                    q, k, v,
-                    max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-                    max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                    softmax_scale=self.scale, causal=True, block_table=context.block_tables)
-            return self._sdpa_prefill(q, k, v)
+            # 统一交给 _prefill_attention 分派:
+            #   - 本次 k/v 就是全部历史 (block_tables 为空) -> flash-attn varlen, 最快
+            #   - 需要读 paged cache / 树形掩码          -> 自研 Triton kernel
+            # 注意不能无脑走 flash-attn: 实测 flash_attn 2.8.3 的 varlen_func 一传
+            # block_table 就 core dump (各种 cu_seqlens_k / max_seqlen_k 组合都试过),
+            # 所以"读 cache"这条路径必须用我们自己的实现。
+            return self._prefill_attention(q, k, v)
         else:                                            # decode
             if _HAS_FLASH:
                 return flash_attn_with_kvcache(
