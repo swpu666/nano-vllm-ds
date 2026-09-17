@@ -27,9 +27,12 @@ class Sequence:
         self.num_scheduled_tokens = 0
         self.is_prefill = True
         self.block_table = []
+        # 投机解码: 尾部已占用 KV slot 但尚未被 target 确认的 draft token 数
+        self.num_spec_tokens = 0
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.greedy = sampling_params.greedy
 
     def __len__(self):
         return self.num_tokens
@@ -69,6 +72,25 @@ class Sequence:
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
+
+    def append_spec_tokens(self, token_ids: list[int]):
+        """把 draft 候选临时挂到序列尾部并占住对应的 KV slot。
+
+        这些 token 还没被 target 确认; 验证后未被接受的部分必须由
+        BlockManager.trim 回滚(同时回收跨出的 block)。
+        """
+        self.token_ids.extend(token_ids)
+        self.num_spec_tokens = len(token_ids)
+        self.num_tokens = len(self.token_ids)
+        self.last_token = self.token_ids[-1]
+
+    def pop_tokens(self, n: int):
+        """从尾部删除 n 个 token; block 的回收交给 BlockManager.trim。"""
+        if n <= 0:
+            return
+        del self.token_ids[-n:]
+        self.num_tokens = len(self.token_ids)
+        self.last_token = self.token_ids[-1]
 
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids

@@ -19,6 +19,12 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    # 投机解码: draft_model 非空且 num_speculative_tokens > 0 时启用
+    draft_model: Optional[str] = None
+    num_speculative_tokens: int = 5
+    # draft/target 词表不等长时 (如 Qwen2.5-0.5B 151936 vs 7B 152064),
+    # 概率空间统一截断到公共前缀后重归一化; 该项记录被丢弃的尾部 id 数
+    spec_common_vocab: int = -1
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

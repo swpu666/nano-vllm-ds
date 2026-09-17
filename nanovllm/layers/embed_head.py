@@ -56,7 +56,7 @@ class ParallelLMHead(VocabParallelEmbedding):
 
     def forward(self, x: torch.Tensor):
         context = get_context()
-        if context.is_prefill:
+        if context.is_prefill and not context.spec_verify:
             last_indices = context.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
         # fp16 matmul (lm_head 输入经 norm 归一化, std 小); 权重为完整 fp16 占显存大, 不全量转 fp32

@@ -108,6 +108,43 @@ class BlockManager:
         if len(seq) % self.block_size == 1:
             seq.block_table.append(self._allocate_block())
 
+    def may_append_n(self, seq: Sequence, n: int) -> bool:
+        """为序列尾部一次性新增的 n 个 token 补齐 block (投机解码批量占位用)。
+
+        与 may_append 逐 token 判断等价, 但一次算清所需 block 数,
+        便于在不足时提前返回 False 由调度层降级, 避免半分配的中间状态。
+        """
+        num_blocks = (seq.num_tokens + self.block_size - 1) // self.block_size
+        num_new = num_blocks - len(seq.block_table)
+        if len(self.free_block_ids) < num_new:
+            return False
+        for _ in range(num_new):
+            seq.block_table.append(self._allocate_block())
+        return True
+
+    def trim(self, seq: Sequence, num_trim: int):
+        """投机解码回滚: 丢弃尾部 num_trim 个未被 target 确认的 draft token。
+
+        may_append / may_append_n 的对偶操作。必须释放跨出的 block, 否则这些
+        block 会一直占着 ref_count 不被回收, 长跑几个 step 就会耗尽 KV cache。
+        注意 spec 期间从不调用 hash_blocks, 这些 block 的 hash 一定为 -1,
+        所以释放无需清理 hash_to_block_id (被 _deallocate_block 内部跳过)。
+        """
+        for _ in range(num_trim):
+            seq.pop_tokens(1)
+            if len(seq) % self.block_size == 0 and seq.block_table:
+                self._release_last_block(seq)
+        seq.num_spec_tokens = 0
+        assert len(seq.block_table) == seq.num_blocks, \
+            f"trim 后 block_table 长度 {len(seq.block_table)} 与 num_blocks {seq.num_blocks} 不一致"
+
+    def _release_last_block(self, seq: Sequence):
+        block_id = seq.block_table.pop()
+        block = self.blocks[block_id]
+        block.ref_count -= 1
+        if block.ref_count == 0:
+            self._deallocate_block(block_id)
+
     def hash_blocks(self, seq: Sequence):
         start = seq.num_cached_tokens // self.block_size
         end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size
