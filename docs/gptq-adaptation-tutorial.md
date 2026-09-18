@@ -581,7 +581,7 @@ $PY tests/profile_spec.py 5
 - **双 kernel 精度分级 + 性能结果**：decode / 短 prefill 走 fp32 精确累加核 `ordered_gptq_linear` 保数值，长 prefill 走 `tl.dot` 核 `fused_gptq_linear`（已验证与 cuBLAS 逐位一致）；反量化路径吞吐 **8.5 → 77.4 tok/s（9.1×）**，权重显存锁定 5.2 GiB。
 - **针对 decode 自适应 GEMM 分块（occupancy 分析定位）**：按序列长度 M 自适应选 BM/BN/BK——用 occupancy 分析（CTA 数 = ⌈M/BM⌉×⌈N/BN⌉ 对比 82 SM）定位到 decode 小 M 时固定分块填不满 SM（旧 32×64 在 q_proj 仅 56 CTA < 82 SM、约 1/3 空转），据此改小分块提高 CTA 占用、长 prefill 用 128×128 吃满算力。
 - **新增 draft-target 投机解码模块，接入 continuous batching**：在引擎里新增「γ 次 draft + 1 次 target verify + 拒绝采样」的轮次，展开为 4 个子模块 —— ① **draft 模型与双 KV pool**：draft 走独立的未量化分支（`models/qwen2_dense.py`），target/draft 各持一份 paged KV cache 并**按 block 字节比切分显存预算**（draft 占 target 的 21%），两边共用同一套 block/slot 布局；② **轮次调度接入**：新增 draft/verify 步骤类型，支持**同一 batch 内各序列接受长度不同**（序列级异构长度），TP worker 用轮次派生的确定性 seed 保证各 rank 采出同一个 draft token；③ **KV 占位与回滚**：draft token「先占位后确认」，被拒部分由 `may_append_n` / `trim` 连同跨出去的 block 一起回收（长跑验证空闲 block 数完全回到起点）；④ **轮次收尾**：`max_tokens` 截断、EOS 截断、finish 判定，投机期间不 commit prefix cache（被拒候选若被 hash 会污染后续前缀命中）。
-- **自研 Triton paged-KV attention kernel（causal 前缀 + flash-decoding 分段并行）**：kernel 内**直接按 `block_table` 从 paged cache 取 K/V**（不物化成连续内存），前缀段与本次新增段分两段走 online softmax 合并，掩码按「query i 可看 key ≤ i + cached_len」构造；每个 program 处理一个 (query 行, head)，并沿 key 维切成 N_SPLITS 段并行后二次归约（decode 时 batch 小，否则填不满 82 个 SM）。替换掉原 sdpa fallback 后，引擎基线本身的 4 并发吞吐 77.4 → 111.6 tok/s。
+- **分页 KV attention 接入 flash-attn 原生接口（Triton kernel 兜底变长/无 flash）**：decode 与投机解码 verify 直接走 flash-attn 的 **`flash_attn_with_kvcache`**——前三个参数是 `(q, k_cache, v_cache)` 整块 paged cache，本次新增 token 经 `k=/v=` 追加在 `cache_seqlens` 之后，掩码即标准自回归 causal，K/V **按 `block_table` 从 paged cache 取、不物化到连续内存**，数值质量也优于自研 kernel；flash-attn 要求 batch 内定长，所以 chunked-prefill 续段这类变长情形仍保留自研 Triton `cached_causal_attn_kernel`（前缀/新增两段 online softmax 合并）兜底，它同时也覆盖无 flash-attn 的环境。替换掉原 sdpa fallback 后，引擎基线本身的 4 并发吞吐 77.4 → 111.6 tok/s。
 - **draft 单步 forward 的 CUDA Graph 化（profiler 定位 launch-bound）**：0.5B draft 一次 forward 里 GPU 只算 2.7 ms、墙钟 20 ms（约 600 次 kernel launch），γ+1 次 draft 的 launch 开销会把投机收益全部吃掉（未 graph 化时加速比仅 **0.70×**）；按 batch size 缓存 CUDA graph、把权重/lm_head/attention 全部固化后，单步 **20.7 → 2.77 ms**，端到端加速比 0.70× → **3.96×**。
 - **投机解码的正确性验证（强证据 + 词表不等长处理）**：以「不开投机」的同引擎输出为 ground truth，greedy 下 4 条 prompt **逐 token 相同**；采样模式下用拒绝采样保证输出分布不变（首 token 分布 TVD 0.006、bonus 分布 TVD 0.011），并注入 4 种实现错误（漏除 q、残差分布用 p / 用 q、bonus 取错位置）验证检验**逐个都能抓住**。draft/target 词表不等长（151936 vs 152064）时把概率空间截断到公共前缀后重归一化，被丢弃的尾部概率质量 7.8e-9。
 - **动态 γ（按延迟模型在线选 draft 长度）**：固定 γ 只在一个工作点最优。在线测出 draft/target 单步耗时比 c（本配置 ≈0.07），用 `γ* = argmax (1−α^(γ+1))/((1−α)(1+γ·c))` 选长度，并用**每个 γ 的实测接受长度**（而非几何模型）+ 10% 切换滞后抑制抖动；4 并发吞吐 289.3 → **294.0**，换 draft/硬件导致 c 变化时无需重新调参（c 从 0.07 升到 0.3 时最优 γ 会从 7 降到 2）。
@@ -623,17 +623,18 @@ $PY tests/profile_spec.py 5
 **⑥ 投机解码怎么接进 continuous batching**（对应 bullet 6）
 - **一轮的形状**：γ 次 draft decode → 1 次 target verify（query 是 γ+1 个位置）→ 拒绝采样 → 回滚未被接受的部分。产出 `n_accepted + 1` 个 token（被拒时用 `(p−q)₊` 重采样的修正 token，全接受时白送一个 bonus token）。
 - **draft 要跑 γ+1 次而不是 γ 次**：第 γ+1 次的输出被丢弃，作用只是把第 `L+γ−1` 个位置的 K/V 补进 draft cache —— 下一轮若 bonus 也被接受，draft 的首个 query 正好落在那个位置，缺了它就会读到脏显存。
-- **verify 的 query 起点是 `x_{L−1}` 而不是 `x_L`**：这样 `seqlen_k − seqlen_q = L−1` 恰好等于 cache 里的有效长度，可以直接复用 varlen + `block_table` 的既有语义（chunked prefill 用的是同一套约定），代价只是 `slot(L−1)` 被重写一次（内容不变）。
+- **verify 的 query 起点是 `x_{L−1}` 而不是 `x_L`**：这样 `seqlen_k − seqlen_q = L−1` 恰好等于 cache 里的有效长度，可以直接复用 `flash_attn_with_kvcache` 的 paged 语义（cache_seqlens=L−1，本次 k/v 当作追加在 cache 之后的新 token；chunked prefill 续段用的是同一套「前缀在 cache、新增在 k/v」约定），代价只是 `slot(L−1)` 被重写一次（内容不变）。
 - **占位与回滚**：draft token 先占位（append + 分配 block）、verify 后再确认；未被接受的由 `trim` 连同跨出的 block 一起回收 —— 只回滚 token 不回收 block 的话，几个 step 就会把 KV cache 吃光。
 - **序列级异构接受长度**：同一个 batch 里 seq A 接受 3 个、seq B 接受 1 个是常态，verify 的 `position_ids` / `slot_mapping` / 回滚数量都按序列分别构造。
 - **多 rank 一致性**：一次 `run_spec` 调用内部无法中途同步，所以各 rank 用「轮次 + 步数」派生的**确定性 seed** 采样，保证同一轮采出相同的 draft token。
 - **为什么选投机解码而不是 TP / PD 分离**：本机双卡 3090 **无 NVLink**（`nvidia-smi topo` 显示 PHB，走 PCIe），跨机只有以太网；TP 每层要 2 次 all-reduce、PD 分离要搬整段 KV（7B 约 0.11 MB/token，2k prompt ≈ 230 MB，1 Gbps 下 1.8 s ≫ prefill 本身 ~100 ms），都吃不到收益。投机解码通信量为零，是这套硬件上唯一能稳定拿正收益的方向。
 
-**⑦ Triton paged-KV attention kernel 怎么写**（对应 bullet 7）
-- **为什么不能直接用 SDPA**：本机没装 flash-attn，attention 一直走 sdpa fallback；而 PyTorch 的 `is_causal` 在 `seqlen_q < seqlen_k` 时等价于 `j <= i`，**不会**自动补偿 `(S−L)` 偏移（用最小实验扫掩码偏移确认：`off=0` 与 `is_causal` 完全一致，`off=S−L` 才是我们真正需要的），于是排在 k/v 最前面的历史前缀会被整段 mask 掉。显式传 float mask 可以修正，但会退化到 math backend、复杂度 O(L·S·D)，对 verify 来说比省下的时间还贵。
-- **kernel 结构**：每个 program 负责一个 `(query 行, head)`，前缀部分**按 `block_table` 直接从 paged cache 取 K/V**（`cache[block_id, j % block_size, kv_head, :]`，不物化成连续内存），本次新增部分从 contiguous k/v 取；两段共用一份 online softmax（`m/l/acc`，用 `exp(m_old − m_new)` 缩放续接），掩码按「query i 可看 key ≤ i + cached_len」构造。
-- **flash-decoding 分段**：decode 时每序列只有 1 个 query token，grid 若只有 `(batch, heads)` 个 program，batch 小时连 82 个 SM 都填不满；所以沿 key 切成 `N_SPLITS` 段并行，各自输出未归一化的 `(m, l, acc)`，再由第二个 kernel 归约合并。
-- **一个硬约束**：`N_SPLITS` 只能由**静态形状**决定（batch / heads / SM 数），不能读 `ctx_lens` 的实际值 —— 因为这条路径会被 CUDA graph 捕获，捕获期间任何 GPU→CPU 同步都会让 capture 直接失败。
+**⑦ 分页 KV attention：flash-attn 原生接口为主、Triton 兜底**（对应 bullet 7）
+- **为什么不能无脑上 SDPA / flash-attn varlen**：① SDPA 不支持 paged / `block_table`，只能吃连续 K/V，读分页 cache 得先把 KV 按 block_table gather 成连续张量（把分页省下的带宽又吐回去，decode 每步都 gather 整段历史更慢）；② PyTorch 的 `is_causal` 在 `seqlen_q < seqlen_k` 时不补偿 `(S−L)` 偏移（`off=0` 与 `is_causal` 完全一致，`off=S−L` 才是 verify 要的），于是历史前缀会被整段 mask 掉；③ flash-attn 的 `flash_attn_varlen_func` 一传 `block_table` 就 core dump（实测各种 cu_seqlens 组合都试过）。
+- **正解（decode + verify）**：直接走 flash-attn 的 **`flash_attn_with_kvcache`** —— 这是 vLLM 用的分页 KV 原生接口，前三个参数是 `(q, k_cache, v_cache)`（整块 paged cache），本次新增 token 通过 `k=/v=` 传入、逻辑上追加在 `cache_seqlens` 之后，掩码即标准自回归 causal；K/V 全程按 `block_table` 从 paged cache 取，**不物化到连续内存**，且数值质量优于自研 kernel（装上 flash-attn 后 α 从 0.48~0.56 跳到 0.74~0.90）。
+- **Triton `cached_causal_attn_kernel` 退为兜底**：flash-attn 要求 batch 内**定长** seqlen，而 chunked-prefill 续段会变长；这部分仍用自研 Triton kernel（每个 program 负责一个 `(query 行, head)`，前缀按 `block_table` 从 paged cache 取 K/V、本次新增从 contiguous k/v 取，两段共用 online softmax，掩码「query i 看 key ≤ i + cached_len」）。它也用于**无 flash-attn 的环境**。
+- **flash-decoding 分段（`_decode_split_kernel` / `_decode_reduce_kernel`）**：现在只是**无 flash-attn 时的 decode fallback**；原本为解决 decode 单 query token 填不满 82 个 SM 而沿 key 切成 `N_SPLITS` 段并行再归约。
+- **一个硬约束**：draft 单步 forward 被 CUDA graph 捕获，期间任何 GPU→CPU 同步都会让 capture 失败，所以相关静态量（如分段数）只能由**静态形状**（batch / heads / SM 数）决定，不能读 `ctx_lens` 实际值。
 
 **⑧ draft 的 launch-bound 怎么定位、graph 怎么做**（对应 bullet 8）
 - **定位**：用 torch profiler 打 draft 的单步 forward —— GPU kernel 合计只有 2.7 ms，Self CPU 5.4 ms，墙钟却 20 ms；按 call 数估约 600 次 kernel launch，属纯 launch-bound。此时端到端加速比只有 **0.70×**（γ+1 次 draft 的开销把收益全吃掉了）。
@@ -687,7 +688,7 @@ PyTorch、Triton、GPTQ、weight-only quantization、int4、group-wise dequant�
 2. 反量化在 fp32 下分块完成、再以 fp16 喂 GEMM，对齐 vLLM 的数值行为并避免 fp16 溢出。
 3. 性能剖析定位到 **bandwidth-bound**（朴素逐元素反量化访存量约为权重的 30 倍，仅 2 tok/s），据此实现 Triton **fused dequant-GEMM**：把反量化融进 GEMM kernel（展开见"口头展开"③），并设为默认路径。
 4. 以**原版引擎 + 未量化模型**做同口径基线，量化后显存 14.22 → 5.20 GiB（**省 63%**）、4 并发吞吐 78.0 → 76.7（**仅降 1.7%**）、TTFT 31.5 → 35.8 ms（**+13%**）—— 量化换来的是显存余量而非加速；并明确与 Marlin 的差距已非数值，而是 kernel 质量（权重 repack）+ 调度栈（CUDA Graph）。
-5. 用量化腾出的显存装入 0.5B draft 模型，实现 **draft-target 投机解码**：新增 draft/verify 轮次并接入 continuous batching（支持序列级异构接受长度、draft token 占位与被拒回滚），自研 **Triton paged-KV attention kernel** 让 verify 能读到历史 KV，并把 **draft 单步 forward 用 CUDA Graph 固化**解决 launch-bound。
+5. 用量化腾出的显存装入 0.5B draft 模型，实现 **draft-target 投机解码**：新增 draft/verify 轮次并接入 continuous batching（支持序列级异构接受长度、draft token 占位与被拒回滚），分页 KV attention 走 flash-attn 原生 `flash_attn_with_kvcache` 接口让 verify 读到历史 KV（变长续段/无 flash-attn 时退化为自研 Triton kernel），并把 **draft 单步 forward 用 CUDA Graph 固化**解决 launch-bound。
 6. 投机解码的正确性同样用强证据：greedy 下与不开投机的输出**逐 token 相同（4/4）**，采样模式下用拒绝采样保证分布不变（TVD 0.006），并注入 4 种实现错误验证检验逐个都能抓住。
 
 **R（结果）**：量化侧 —— 正确性 64/64 全匹配；权重显存 14.2 → 5.2 GiB（省 63%）；4 并发吞吐 78.0 → 76.7（仅降 1.7%）、TTFT +13%；反量化路径吞吐 8.5 → **77.4 tok/s**。
@@ -748,7 +749,7 @@ PyTorch、Triton、GPTQ、weight-only quantization、int4、group-wise dequant�
 | `nanovllm/engine/block_manager.py` | `may_append_n`（批量占位）+ `trim`（回滚并回收跨出的 block） |
 | `nanovllm/engine/sequence.py` | `append_spec_tokens` / `pop_tokens` |
 | `nanovllm/models/qwen2_dense.py` | 未量化 Qwen2，供 draft 用（`models/qwen2.py` 已被改写成 GPTQ-only） |
-| `nanovllm/layers/attention.py` | `cached_causal_attn_kernel`（paged 前缀 causal）+ `_decode_split_kernel` / `_decode_reduce_kernel`（flash-decoding） |
+| `nanovllm/layers/attention.py` | decode/verify 走 `flash_attn_with_kvcache`（flash-attn 原生 paged）；`cached_causal_attn_kernel`（变长 paged 续段 / 无 flash-attn 兜底）+ `_decode_split_kernel` / `_decode_reduce_kernel`（无 flash-attn 时的 decode fallback） |
 | `bench_spec.py` | 投机解码性能基准：γ 扫描 + 接受率 + KV block 泄漏检查 |
 | `tests/verify_spec.py` | 正确性三层：A greedy 黄金、B 分布等价 + 变异测试、C 端到端逐 token |
 | `tests/check_spec_vocab.py` | draft/target 词表兼容性前置检查 |

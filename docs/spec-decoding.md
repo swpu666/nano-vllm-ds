@@ -52,7 +52,8 @@
 
 **b) verify 的 query 起点是 `x_{L-1}` 而不是 `x_L`。**
 这样 `seqlen_k - seqlen_q = L-1` 恰好等于 cache 里的有效长度，可以直接复用
-flash-attn varlen + block_table 的既有语义（chunked prefill 用的是同一套约定）。
+`flash_attn_with_kvcache` 的 paged 语义（cache_seqlens=L-1，本次 k/v 当作追加在 cache
+之后的新 token；chunked prefill 续段用的是同一套「前缀在 cache、新增在 k/v」约定）。
 代价是 `slot(L-1)` 会被重写一次，但内容不变，换来的是不需要为"少读一个 token"特判掩码。
 
 **c) 占位 token 会让 `num_completion_tokens` 虚增 γ。**
@@ -65,11 +66,18 @@ flash-attn varlen + block_table 的既有语义（chunked prefill 用的是同�
 
 ## 3. 三个性能/正确性坑
 
-### 3.1 没有 flash-attn 时，sdpa fallback 根本不读 paged cache
+### 3.1 sdpa fallback 根本不读 paged cache（无 flash-attn 时的历史问题）
 
-本机环境**没有安装 flash_attn**，`Attention` 一直走 `_sdpa_prefill` / `_sdpa_decode`
-fallback。前者的实现完全忽略 `block_table`，于是任何"部分 KV 落在 cache 里"的调用
-（chunked prefill 续段、投机解码的 verify）都会**丢掉整个历史上下文**。
+**现状**：本机已安装 flash-attn（2.8.3），decode 与投机解码 verify 现在直接走
+`flash_attn_with_kvcache`——这是 vLLM 用的分页 KV 原生接口，原生支持 `block_table`。
+但 flash-attn 的 `flash_attn_varlen_func` 一传 `block_table` 就 core dump，且它要求
+batch 内定长，所以 **变长 chunked-prefill 续段**仍保留自研 Triton `cached_causal_attn_kernel`
+兜底；该 kernel 同时也用于**无 flash-attn 的环境**。
+
+**历史背景（为什么需要 paged 专用路径）**：在没有 flash-attn（或 SDPA）直接读 paged cache
+的能力时，`Attention` 只能走 `_sdpa_prefill` / `_sdpa_decode` fallback。前者的实现完全忽略
+`block_table`，于是任何"部分 KV 落在 cache 里"的调用（chunked prefill 续段、投机解码的
+verify）都会**丢掉整个历史上下文**。
 
 ### 3.2 PyTorch SDPA 的 `is_causal` 在 `L ≠ S` 时不等价于 offset 因果
 
@@ -84,8 +92,10 @@ L=5 S=15:
 也就是说 gather 出来的前缀被整段 mask 掉了。显式传 float mask 可以修正，但会退化到
 math backend，复杂度 O(L·S·D) 且中断 flash，对 verify 来说比省下的时间还贵。
 
-**解决**：`layers/attention.py` 新增 `cached_causal_attn_kernel`，直接从 paged cache
-读 key/value（不物化到连续内存），掩码按 `j <= i + cached` 手工处理。
+**解决**：定长路径（decode / verify）用 `flash_attn_with_kvcache`（K/V 按 `block_table`
+从 paged cache 取，不物化到连续内存，数值质量也优于自研 kernel）；变长 / 无 flash-attn 时
+退化为 `cached_causal_attn_kernel`，直接从 paged cache 读 key/value（不物化到连续内存），
+掩码按 `j <= i + cached` 手工处理。
 
 ### 3.3 draft 单步 forward 被 launch 开销主导
 
@@ -170,7 +180,7 @@ nanovllm/
   engine/block_manager.py  may_append_n / trim  (占位与回滚)
   engine/sequence.py       append_spec_tokens / pop_tokens
   models/qwen2_dense.py    未量化 Qwen2, 供 draft 用 (models/qwen2.py 已是 GPTQ-only)
-  layers/attention.py      paged cache prefill kernel + flash-decoding decode kernel
+  layers/attention.py      decode/verify 走 flash_attn_with_kvcache（flash-attn 原生 paged）；cached_causal_attn_kernel（变长 paged 续段 / 无 flash-attn 兜底）+ flash-decoding 两阶段 kernel（无 flash-attn 时 decode fallback）
 bench_spec.py              性能基准 (含 KV block 泄漏检查)
 tests/verify_spec.py       A/B/C 三层正确性
 tests/check_spec_vocab.py  draft/target 词表兼容性前置检查

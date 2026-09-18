@@ -294,14 +294,52 @@ class Attention(nn.Module):
         return torch.cat(outs, dim=0)
 
     def _prefill_with_cache(self, q, k, v, block_tables, cu_q_list, cached_list):
-        """prefill 且部分 KV 在 paged cache 里 -> 走 Triton kernel。
+        """prefill 且部分 KV 在 paged cache 里。
 
-        每个 query 行需要三个额外信息 (所属序列 / 序列内下标 / 该序列的 cache 前缀长度),
-        在 CPU 侧摊平成 tensor 传进去, kernel 里就不必再二分查找序列边界了。
+        主要消费者是投机解码的 verify: 每条链 query=[x_{L-1}, d_1..d_γ] 共 γ+1 个位置,
+        前缀 [0, L-1) 在 paged cache, 新 token [L-1, L+γ-1] 来自本次 k/v。
+        这种**定长**情形直接走 flash-attn 的分页 KV 接口 `flash_attn_with_kvcache`
+        (推理部署必然带 flash-attn, 它原生支持 block_table 且数值质量优于自研 kernel);
+        只有「变长 chunked-prefill 续段」或「无 flash-attn 环境」才回退到自研 Triton kernel。
+
+        flash_attn_with_kvcache 的语义: 总 KV = cache_seqlens(前缀, 从 paged cache 读)
+        + seqlen_k(本次 k/v, 当作追加在 cache 之后的新 token)。q 落在
+        [cache_seqlens, cache_seqlens+seqlen_q-1], causal 即标准自回归掩码 —— 与这里
+        q/k/v 同源(同一份 hidden 的三种投影)、cache_seqlens=L-1 完全吻合。
         """
         dev = q.device
+        B = len(cu_q_list) - 1
+        n_rows = q.shape[0]
+
+        # 定长判断: verify 必然定长; chunked-prefill 续段可能变长(flash-attn 要求定长)
+        seqlen_q = cu_q_list[1] - cu_q_list[0]
+        uniform = all((cu_q_list[i + 1] - cu_q_list[i]) == seqlen_q for i in range(B))
+
+        if _HAS_FLASH and uniform:
+            # q/k/v 已是 (total, H/Hk, D), 按 (B, seqlen_q, H/Hk, D) 重组。
+            # 注意本版本 flash_attn_with_kvcache 的签名: 前三个位置是
+            # (q, k_cache, v_cache) —— k_cache/v_cache 是**整块 paged cache**,
+            # 分页大小由 k_cache.shape[1] 推断; 本次新增的 token 通过 k=/v= 传入,
+            # 会被逻辑上"追加"在 cache_seqlens 之后。cache_seqlens 即前缀长度 L-1。
+            q4 = q.reshape(B, seqlen_q, self.num_heads, self.head_dim)
+            k4 = k.reshape(B, seqlen_q, self.num_kv_heads, self.head_dim)
+            v4 = v.reshape(B, seqlen_q, self.num_kv_heads, self.head_dim)
+            cache_seqlens = torch.tensor(cached_list, dtype=torch.int32, device=dev)
+            fa_out = flash_attn_with_kvcache(
+                q4, self.k_cache, self.v_cache,
+                k=k4, v=v4,
+                cache_seqlens=cache_seqlens,
+                block_table=block_tables,
+                softmax_scale=self.scale,
+                causal=True,
+            )
+            return fa_out.reshape(n_rows, self.num_heads * self.head_dim)
+
+        # ---- 回退: 自研 Triton kernel (变长 paged 续段 / 无 flash-attn) ----
+        # 每个 query 行需要三个额外信息 (所属序列 / 序列内下标 / 该序列的 cache 前缀长度),
+        # 在 CPU 侧摊平成 tensor 传进去, kernel 里就不必再二分查找序列边界了。
         row_seq, row_local, row_cached, row_base = [], [], [], []
-        for i in range(len(cu_q_list) - 1):
+        for i in range(B):
             s, e = cu_q_list[i], cu_q_list[i + 1]
             for t in range(e - s):
                 row_seq.append(i)
@@ -312,7 +350,6 @@ class Attention(nn.Module):
         def _t(xs):
             return torch.tensor(xs, dtype=torch.int32, device=dev)
 
-        n_rows = q.shape[0]
         out = torch.empty_like(q)
         assert self.head_dim in (32, 64, 128, 256), "kernel 要求 head_dim 为 2 的幂"
         cached_causal_attn_kernel[(n_rows, self.num_heads)](
