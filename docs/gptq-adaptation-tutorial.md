@@ -580,11 +580,11 @@ $PY tests/profile_spec.py 5
 - **自研 Triton fused dequant-GEMM（默认路径）**：把反量化融进 GEMM kernel —— 打包的 int4 `qweight`/`qzeros` 在 kernel 内按 `group_size` 解包、算 `(w − z) · s` 后**直接喂 `tl.dot`**，全程不把 fp16 权重写回 HBM（int4 常驻显存、fp16 零物化）；因 cuBLAS 仅有 INT8、无 int4 非对称 per-group dequant-GEMM，这是**唯一能同时拿到省显存 + TensorCore 速度**的写法。
 - **双 kernel 精度分级 + 性能结果**：decode / 短 prefill 走 fp32 精确累加核 `ordered_gptq_linear` 保数值，长 prefill 走 `tl.dot` 核 `fused_gptq_linear`（已验证与 cuBLAS 逐位一致）；反量化路径吞吐 **8.5 → 77.4 tok/s（9.1×）**，权重显存锁定 5.2 GiB。
 - **针对 decode 自适应 GEMM 分块（occupancy 分析定位）**：按序列长度 M 自适应选 BM/BN/BK——用 occupancy 分析（CTA 数 = ⌈M/BM⌉×⌈N/BN⌉ 对比 82 SM）定位到 decode 小 M 时固定分块填不满 SM（旧 32×64 在 q_proj 仅 56 CTA < 82 SM、约 1/3 空转），据此改小分块提高 CTA 占用、长 prefill 用 128×128 吃满算力。
-- **新增 draft-target 投机解码模块，接入 continuous batching**：在引擎里新增「γ 次 draft + 1 次 target verify + 拒绝采样」的轮次，展开为 4 个子模块 —— ① **draft 模型与双 KV pool**：draft 走独立的未量化分支（`models/qwen2_dense.py`），target/draft 各持一份 paged KV cache 并**按 block 字节比切分显存预算**（draft 占 target 的 21%），两边共用同一套 block/slot 布局；② **轮次调度接入**：新增 draft/verify 步骤类型，支持**同一 batch 内各序列接受长度不同**（序列级异构长度），TP worker 用轮次派生的确定性 seed 保证各 rank 采出同一个 draft token；③ **KV 占位与回滚**：draft token「先占位后确认」，被拒部分由 `may_append_n` / `trim` 连同跨出去的 block 一起回收（长跑验证空闲 block 数完全回到起点）；④ **轮次收尾**：`max_tokens` 截断、EOS 截断、finish 判定，投机期间不 commit prefix cache（被拒候选若被 hash 会污染后续前缀命中）。
-- **分页 KV attention 接入 flash-attn 原生接口（Triton kernel 兜底变长/无 flash）**：decode 与投机解码 verify 直接走 flash-attn 的 **`flash_attn_with_kvcache`**——前三个参数是 `(q, k_cache, v_cache)` 整块 paged cache，本次新增 token 经 `k=/v=` 追加在 `cache_seqlens` 之后，掩码即标准自回归 causal，K/V **按 `block_table` 从 paged cache 取、不物化到连续内存**，数值质量也优于自研 kernel；flash-attn 要求 batch 内定长，所以 chunked-prefill 续段这类变长情形仍保留自研 Triton `cached_causal_attn_kernel`（前缀/新增两段 online softmax 合并）兜底，它同时也覆盖无 flash-attn 的环境。替换掉原 sdpa fallback 后，引擎基线本身的 4 并发吞吐 77.4 → 111.6 tok/s。
-- **draft 单步 forward 的 CUDA Graph 化（profiler 定位 launch-bound）**：0.5B draft 一次 forward 里 GPU 只算 2.7 ms、墙钟 20 ms（约 600 次 kernel launch），γ+1 次 draft 的 launch 开销会把投机收益全部吃掉（未 graph 化时加速比仅 **0.70×**）；按 batch size 缓存 CUDA graph、把权重/lm_head/attention 全部固化后，单步 **20.7 → 2.77 ms**，端到端加速比 0.70× → **3.96×**。
-- **投机解码的正确性验证（强证据 + 词表不等长处理）**：以「不开投机」的同引擎输出为 ground truth，greedy 下 4 条 prompt **逐 token 相同**；采样模式下用拒绝采样保证输出分布不变（首 token 分布 TVD 0.006、bonus 分布 TVD 0.011），并注入 4 种实现错误（漏除 q、残差分布用 p / 用 q、bonus 取错位置）验证检验**逐个都能抓住**。draft/target 词表不等长（151936 vs 152064）时把概率空间截断到公共前缀后重归一化，被丢弃的尾部概率质量 7.8e-9。
-- **动态 γ（按延迟模型在线选 draft 长度）**：固定 γ 只在一个工作点最优。在线测出 draft/target 单步耗时比 c（本配置 ≈0.07），用 `γ* = argmax (1−α^(γ+1))/((1−α)(1+γ·c))` 选长度，并用**每个 γ 的实测接受长度**（而非几何模型）+ 10% 切换滞后抑制抖动；4 并发吞吐 289.3 → **294.0**，换 draft/硬件导致 c 变化时无需重新调参（c 从 0.07 升到 0.3 时最优 γ 会从 7 降到 2）。
+- **新增 draft-target 投机解码模块，接入 continuous batching**：在引擎里新增「γ 次 draft decode + 1 次 target verify + 拒绝采样」轮次，支持序列级异构接受长度与 draft token 占位/回滚；draft 走未量化分支（`models/qwen2_dense.py`），target/draft 各持 paged KV cache 并按 block 字节比切分显存预算（draft 占 21%）。
+- **分页 KV attention 接入 flash-attn 原生接口（Triton 兜底变长）**：decode / verify 直接走 flash-attn `flash_attn_with_kvcache`（K/V 按 `block_table` 取、不物化连续内存），变长续段 / 无 flash-attn 时退化自研 Triton `cached_causal_attn_kernel`；替换 sdpa fallback 后引擎基线 4 并发吞吐 77.4 → 111.6 tok/s。
+- **draft 单步 forward 的 CUDA Graph 化（profiler 定位 launch-bound）**：0.5B draft 一次 forward GPU 仅算 2.7 ms、墙钟 20 ms（约 600 次 kernel launch），γ+1 次 draft 的 launch 开销吃掉收益（未 graph 加速比仅 0.70×）；按 batch size 缓存 graph 固化后单步 20.7 → 2.77 ms，端到端 0.70× → 3.96×。
+- **投机解码的正确性验证（强证据 + 词表不等长处理）**：greedy 下与「不开投机」的同引擎输出逐 token 相同（4/4）；采样用拒绝采样保证分布不变（首 token TVD 0.006），注入 4 种实现错误验证逐个能抓住；词表不等长（151936 vs 152064）截断到公共前缀重归一化（尾部 7.8e-9）。
+- **动态 γ（按延迟模型在线选 draft 长度）**：在线测 draft/target 单步耗时比 c（≈0.07），用 `γ* = argmax (1−α^(γ+1))/((1−α)(1+γ·c))` 选长度，并用实测接受长度表 + 10% 滞后抑制抖动；4 并发 289.3 → 294.0，换 draft/硬件免调参（c 0.07→0.3 时最优 γ 7→2）。
 
 ## 口头展开（面试追问时讲，不写进简历正文）
 
@@ -645,6 +645,12 @@ $PY tests/profile_spec.py 5
 - **三层，不靠"看着像"**：① greedy 下输出必须等于「逐步 argmax」的黄金结果（含每个位置被拒时的修正）；② 采样模式下输出分布必须严格等于 target 分布；③ 端到端与「不开投机」的同引擎输出逐 token 相同（4 条 prompt 全一致）。
 - **变异测试**：注入 4 种实现错误，检验必须逐个抓住 —— 漏除 q（TVD 0.383）、残差分布用 p（0.223）、残差分布用 draft 的 q（0.502）、bonus 取错位置（0.525）；正确实现的 TVD 是 0.006 / 0.011。其中「bonus 取错位置」只看首 token 分布**完全抓不到**（0.0053），必须两个指标都有 —— 这正是变异测试的价值。
 - **词表不等长**：0.5B 声明 151936、7B 声明 152064（多出 128 个 padding 条目）。先用脚本证明两边 tokenizer 在公共 id 区间上逐条一致（151665 词条、0 冲突），再把概率空间截断到公共前缀重归一化；被丢弃的尾部概率质量 7.8e-9，可忽略。反过来也保证 draft 输出的 id 必然 < 公共长度，绝不会让 target 的 embedding 越界。
+
+**⑩ 动态 γ 怎么做的（对应 bullet 10）**
+- **为什么不用固定 γ**：接受率 α 随候选位置下降（越往后越难接受），且 draft/target 的相对快慢 c 取决于硬件与模型。固定 γ 只在一个工作点最优 —— 本配置 γ=7 单请求最高（3.96×），但并发在 γ=5~7 已饱和，且换 draft/硬件就得重调。
+- **选长度的公式**：一轮期望确认 token 数 `(1−α^(γ+1))/(1−α)`，成本约 `1 + γ·c`（`c` = 在线测得的 draft/target 单步耗时比，本配置 ≈0.07）。`γ* = argmax (1−α^(γ+1))/((1−α)(1+γ·c))` 即在「多确认 vs 多花钱」之间求最优。
+- **两个必须做对的细节（否则选歪）**：① 计时只测**纯 GPU 时间** —— draft 循环里每步 `tolist()` 都会同步，把 CPU 时间算进去会让 c 高估 2~3 倍、γ 被压小（实测单请求 decode 从 100 掉到 74）；② 用**实测的 γ→接受长度表**而不是恒定 α 的几何模型 —— 接受率随位置下降，几何模型会高估长链、把 γ 从 7 推到 8 反而变慢。再加 **10% 切换滞后**抑制 γ 在相邻值间抖动。
+- **结果**：4 并发 289.3 → 294.0（+1.6%）。真正价值是**换 draft/硬件免调参** —— c 从 0.07 升到 0.3 时最优 γ 会自动从 7 降到 2，不用人工改配置。
 
 ## 量化指标（放简历"成绩"栏）
 
