@@ -73,6 +73,8 @@ class ModelRunner:
         self.speculator = None
         self.draft_model = None
         self.draft_kv_cache = None
+        # EAGLE 风格 draft head (用 target 隐藏层监督训练, 取代独立 draft 模型)
+        self.eagle_head = None
         self.spec_round = 0
         # 动态 γ: 运行时在 [1, max_gamma] 里挑; current_gamma 由 run_spec 每轮更新
         self.current_gamma = config.num_speculative_tokens
@@ -83,6 +85,8 @@ class ModelRunner:
         self._cost_ratio = 0.0
         if config.draft_model:
             self._init_draft_model(config)
+        if config.eagle_head:
+            self._init_eagle_head(config)
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -166,6 +170,34 @@ class ModelRunner:
         print(f"[spec] draft={config.draft_model} "
               f"γ={config.num_speculative_tokens} "
               f"vocab(draft/target)={draft_config.vocab_size}/{self.config.hf_config.vocab_size}")
+
+    def _init_eagle_head(self, config: Config):
+        """加载训练好的 EAGLE draft head。
+
+        与独立 draft 模型不同, head 不占单独的 paged KV cache (它自带一个每轮重置的
+        短链 KV), 显存开销几乎可忽略; 它直接复用 target 的 embed/lm_head, 只在
+        target 隐藏状态之上多跑一个 transformer block。投机解码因此仍是单卡路径。
+        """
+        assert self.world_size == 1, "投机解码当前仅支持单卡 (TP=1)"
+        assert config.num_speculative_tokens >= 1
+        from nanovllm.models.eagle import EAGLEHead
+        hf = self.config.hf_config
+        head = EAGLEHead(
+            self.model,
+            hidden_size=hf.hidden_size,
+            num_heads=hf.num_attention_heads,
+            num_kv_heads=getattr(hf, "num_key_value_heads", hf.num_attention_heads),
+            head_dim=getattr(hf, "head_dim", hf.hidden_size // hf.num_attention_heads),
+            intermediate_size=hf.intermediate_size,
+            eps=getattr(hf, "rms_norm_eps", 1e-6),
+        )
+        head.load_head(config.eagle_head)
+        head = head.cuda().half().eval()
+        self.eagle_head = head
+        self.speculator = Speculator(config.num_speculative_tokens)
+        print(f"[spec] eagle_head={config.eagle_head} "
+              f"γ={config.num_speculative_tokens} "
+              f"head_params≈{sum(p.numel() for p in head.parameters() if p.requires_grad) / 1e6:.0f}M")
 
     def warmup_model(self):
         torch.cuda.empty_cache()
@@ -325,7 +357,18 @@ class ModelRunner:
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
+        if is_prefill and self.eagle_head is not None:
+            # EAGLE: prefill 同时把 target 在最后一个 prompt token 的隐藏状态存下来,
+            # 作为第一轮 draft 的起点 (head 用 target 隐藏状态而非随机初始化)。
+            hidden = self.model(input_ids, positions)
+            logits = self.model.compute_logits(hidden)
+            cu = get_context().cu_seqlens_q
+            for b, seq in enumerate(seqs):
+                row = int(cu[b + 1].item()) - 1          # 该 seq 最后一个 prompt token 的行
+                seq.eagle_hidden = hidden[row].detach().clone().to(torch.float16)
+                seq.eagle_token = seq.last_token
+        else:
+            logits = self.run_model(input_ids, positions, is_prefill)
         if is_prefill and self.draft_model is not None:
             # prefill 必须同时把 draft 的 KV 写进去: 第一轮 draft decode 是增量 decode,
             # 如果 prompt 的 KV 不在 draft cache 里, 它读到的就是未初始化的显存。
@@ -535,6 +578,8 @@ class ModelRunner:
         后置条件: 返回每 seq 本轮确认的 token 列表; **本函数不回收任何 KV block**,
         被拒绝的部分由调度层按返回值调用 BlockManager.trim 回滚。
         """
+        if self.eagle_head is not None:
+            return self._run_spec_eagle(seqs, num_spec_tokens, greedy)
         G, B, K = num_spec_tokens, len(seqs), num_candidates
         if K > 1 and self.spec_round == 1:
             print("[spec] ⚠ 多候选 (K>1) 是实验特性: paged KV 的 slot 是逻辑连续语义, "
@@ -599,6 +644,63 @@ class ModelRunner:
                 self._make_generator(G))
             if K > 1:
                 result = self._pick_best_candidate(result, B, K)
+        return result
+
+    @torch.inference_mode()
+    def _run_spec_eagle(self, seqs: list[Sequence], G: int, greedy: bool):
+        """EAGLE 一轮: head 起草 γ 个候选 + 1 次 target verify + 拒绝采样。
+
+        与独立 draft 模型路径的唯一区别在"起草":
+          - 起草不再跑一个 draft 模型, 而是由 EAGLEHead 用上一轮存下的
+            (eagle_token, eagle_hidden) 自回归生成 —— eagle_hidden 是 target 在
+            **最后接受位置**的真实隐藏状态 (来自上一轮 verify), 正是 EAGLE
+            "用 target 隐藏层监督"的落点。
+          - verify 之后把 target 在最后接受位置的真实隐藏状态存回 seq, 作为下一轮起点。
+        K 恒为 1 (链式); 占位 / 拒绝采样 / 回滚逻辑与 draft 路径完全一致。
+        """
+        B = len(seqs)
+        temperatures = self.prepare_sample(seqs)
+        # 1) 用上一轮存下的 (eagle_token, eagle_hidden) 自回归起草 γ 个候选
+        reset_context()                       # 保证 lm_head 返回完整 logits (非 prefill 末位)
+        start_tokens = torch.tensor([s.eagle_token for s in seqs], dtype=torch.int64, device="cuda")
+        start_hiddens = torch.stack([s.eagle_hidden for s in seqs], dim=0).to(torch.float16)
+        draft_logits, _ = self.eagle_head.draft_logits(start_tokens, start_hiddens, G)   # (B, G, V)
+        draft_tokens_per_step = []
+        draft_logits_per_step = []
+        for i in range(G):
+            step_logits = draft_logits[:, i]
+            tok = self.speculator.draft_step(step_logits, temperatures, greedy,
+                                             self._make_generator(i), step=i, K=1)
+            toks = tok.tolist()
+            for b, seq in enumerate(seqs):
+                L = len(seq) - G                # K=1: 占位布局就是 [γ 个] 接在真实 token 之后
+                seq.token_ids[L + i] = toks[b]
+            draft_tokens_per_step.append(tok)
+            draft_logits_per_step.append(step_logits)
+
+        # 2) target verify (varlen/prefill 路径), 并捕获隐藏状态供下一轮
+        input_ids, positions = self.prepare_spec_verify(seqs, G, K=1)
+        hidden = self.model(input_ids, positions)                  # (N, H)
+        target_logits = self.model.compute_logits(hidden)
+        cu = get_context().cu_seqlens_q
+        reset_context()
+        # EAGLE 的 draft 极便宜, 不单独计时; 动态 γ 仅按接受率估计
+        if self.dynamic_gamma:
+            self._update_gamma(None, G)
+
+        result = None
+        if self.rank == 0:
+            draft_logits_b = torch.stack(draft_logits_per_step, dim=1)      # (B, G, V)
+            draft_tokens = torch.stack(draft_tokens_per_step, dim=1)        # (B, G)
+            target_logits_b = target_logits.view(B, G + 1, -1)
+            result = self.speculator.verify(
+                target_logits_b, draft_logits_b, draft_tokens, temperatures, greedy,
+                self._make_generator(G))
+            # 存下一轮起点: target 在最后接受位置 (查询下标 n_accepted) 的真实隐藏状态
+            for b, seq in enumerate(seqs):
+                row = int(cu[b].item()) + result.n_accepted[b]
+                seq.eagle_hidden = hidden[row].detach().clone().to(torch.float16)
+                seq.eagle_token = result.accepted_tokens[b][-1]
         return result
 
     @staticmethod

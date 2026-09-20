@@ -21,7 +21,8 @@ class LLMEngine:
         config = Config(model, **config_kwargs)
         Sequence.block_size = config.kvcache_block_size
         self.config = config
-        self.spec_enabled = config.draft_model is not None and config.num_speculative_tokens > 0
+        self.spec_enabled = config.num_speculative_tokens > 0 and (
+            config.draft_model is not None or config.eagle_head is not None)
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")

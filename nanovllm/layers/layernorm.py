@@ -15,19 +15,18 @@ class RMSNorm(nn.Module):
         # 与输入 dtype 一致, 避免 fp32 权重导致输出提升为 float32
         self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.get_default_dtype()))
 
-    @torch.inference_mode()
     def rms_forward(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
         # 归一化在 fp32 下计算(精度), 输出还原为输入 dtype(fp16), 与 vLLM 一致
+        # 注意: 不能用 inplace (mul_), 否则训练时 RMSNorm 参与 autograd 会报错
         dtype = x.dtype
         x = x.float()
         var = x.pow(2).mean(dim=-1, keepdim=True)
-        x.mul_(torch.rsqrt(var + self.eps))
+        x = x * torch.rsqrt(var + self.eps)
         return x.mul(self.weight.float()).to(dtype)
 
-    @torch.inference_mode()
     def add_rms_forward(
         self,
         x: torch.Tensor,
@@ -37,7 +36,7 @@ class RMSNorm(nn.Module):
         x = x.float().add(residual.float())
         residual = x.clone().to(dtype)
         var = x.pow(2).mean(dim=-1, keepdim=True)
-        x.mul_(torch.rsqrt(var + self.eps))
+        x = x * torch.rsqrt(var + self.eps)
         return x.mul(self.weight.float()).to(dtype), residual
 
     def forward(

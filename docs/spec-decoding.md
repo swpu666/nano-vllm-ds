@@ -180,7 +180,7 @@ nanovllm/
   engine/block_manager.py  may_append_n / trim  (占位与回滚)
   engine/sequence.py       append_spec_tokens / pop_tokens
   models/qwen2_dense.py    未量化 Qwen2, 供 draft 用 (models/qwen2.py 已是 GPTQ-only)
-  layers/attention.py      decode/verify 走 flash_attn_with_kvcache（flash-attn 原生 paged）；cached_causal_attn_kernel（变长 paged 续段 / 无 flash-attn 兜底）+ flash-decoding 两阶段 kernel（无 flash-attn 时 decode fallback）
+  layers/attention.py      paged cache prefill kernel + flash-decoding decode kernel
 bench_spec.py              性能基准 (含 KV block 泄漏检查)
 tests/verify_spec.py       A/B/C 三层正确性
 tests/check_spec_vocab.py  draft/target 词表兼容性前置检查
@@ -290,3 +290,58 @@ tree verification 的适用条件是：
    （本次实现是按链组织、共享读了 K 次前缀），这部分留作后续。
 
 `num_spec_candidates` 因此**默认 1**，K>1 标记为实验特性并在运行时打印提示。
+
+## 9. EAGLE draft head（用 target 隐藏层监督训练）
+
+### 9.1 动机：为什么比独立 draft 模型接受率高
+
+第 1~8 节的投机解码用一个**独立的 0.5B draft 模型**去猜 target 的下一个 token。
+draft 与 target 是两套独立权重，draft 只能从"token 分布"上逼近 target，所以接受率
+上限受限于 0.5B 与 7B 的能力差（装 flash-attn 后 α 0.74~0.90）。
+
+EAGLE 的思路不同：**让 draft head 直接消费 target 的隐藏状态**，并显式监督它去
+**预测 target 在下一位置的隐藏状态**。这样 draft head 不只是猜 token 分布，还学会了
+"target 此时的内部表征长什么样"——而下一 token 几乎完全由这个表征决定，所以接受率
+可以显著高于独立 draft 模型（文献里 EAGLE 在 7B 上 α 常到 0.8~0.9+）。
+
+代价：draft head 是一个 1 层 transformer（hidden 维度与 target 相同，约 259M 参数），
+比 0.5B draft 小很多，且**不占额外的 paged KV cache**（它自带一个每轮重置的短链 KV）。
+
+### 9.2 结构（nanovllm/models/eagle.py）
+
+- 输入 = `(token 的 embedding, target 在上一位置的隐藏状态)`，输出 = `(下一 token 的 logits,
+  预测的下一位置 target 隐藏状态)`。
+- `embed` / `lm_head` / 最后的 `final norm` **直接复用 target**（同一对象、冻结），
+  只额外训一个 transformer block（`fc` 投影 + 注意力 + MLP）。
+- 关键点：`model()` 返回的隐藏状态**已经过 final norm**，所以 head 输出也必须再过一次
+  同样的 norm，否则 `lm_head`（在 post-norm 空间训练）收到错误归一化空间的 hidden，
+  draft logits 会全部失真（这是实现时踩的坑：漏掉 final norm 会让 α 直接掉到 0）。
+- 训练目标（在 target 隐藏状态上做监督）：
+  - `logits` 用 CE 预测 `x_{t+1}`；
+  - 预测的隐藏状态用 MSE 逼近 target 在 `t+1` 位置的真实隐藏状态 `H[t+1]`。
+- 推理：verify 返回 target 在"最后接受位置"的**真实隐藏状态**，作为下一轮 head 的起点
+  （复用现有 verify / 拒绝采样框架，正确性不受影响）。
+
+### 9.3 训练（train_eagle.py）
+
+```
+python train_eagle.py --model <gptq> --base_model <dense 基模> \
+    --data <语料> --out eagle_head.pt --steps 2000 --max_len 256 --lr 3e-4
+```
+
+- `--base_model` 用 dense 基模的**最后一层**初始化 block（EAGLE 标准做法，收敛快），
+  `fc` 与两个 norm 默认初始化。
+- 训练数据是**影响 α 的关键**：EAGLE head 要学到 `H[t] → H[t+1]` 的映射，需要
+  与部署领域匹配的足量语料（文献用 ~1B token 级）。本仓库自带的 27k token 教程语料
+  只够验证 pipeline，跑出来的 α 很低；用领域语料 + 数千~上万 step 才能拿到高 α。
+- 实现细节：训练时 block 提为 fp32（master weight）以稳定收敛；head 的 KV 用 list 累积
+  （不能用原地写入的共享 buffer，否则跨步 autograd 报 inplace 错误）；RMSNorm 的归一化
+  必须非原地（mul_ 会断梯度）。
+
+### 9.4 接入与开关
+
+- `Config.eagle_head` 非空且 `num_speculative_tokens > 0` 时启用，取代独立 draft 模型路径。
+- `llm_engine` 把 `eagle_head` 与 `draft_model` 同等视为 spec 开关；`ModelRunner._run_spec_eagle`
+  实现"head 起草 γ 个候选 + 1 次 target verify + 拒绝采样"，其余占位/回滚逻辑与 draft 路径一致。
+- 用法：`LLM(model, eagle_head="eagle_head.pt", num_speculative_tokens=5)`。
+

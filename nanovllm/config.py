@@ -19,8 +19,12 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
-    # 投机解码: draft_model 非空且 num_speculative_tokens > 0 时启用
+    # 投机解码: draft_model 非空且 num_speculative_tokens > 0 时启用 (独立 draft 模型)
     draft_model: Optional[str] = None
+    # EAGLE 风格的 draft head: 用 target 隐藏层监督训练的小 head (见
+    # nanovllm/models/eagle.py + train_eagle.py)。与 draft_model 二选一:
+    # eagle_head 非空且 num_speculative_tokens > 0 时启用, 取代独立 draft 模型路径。
+    eagle_head: Optional[str] = None
     num_speculative_tokens: int = 5
     # 动态 γ: 按接受率 + draft/target 耗时比在线选最优 draft 长度, 上界由本字段给定
     max_speculative_tokens: int = 12

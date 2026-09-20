@@ -762,3 +762,680 @@ PyTorch、Triton、GPTQ、weight-only quantization、int4、group-wise dequant�
 | `tests/check_prefill_cache.py` | 不变式：读 paged cache 的路径 == 整段重算 |
 | `tests/profile_spec.py` | target decode / draft decode / verify 的耗时分解 |
 | `docs/spec-decoding.md` | 投机解码设计文档（流程、三个坑、实测） |
+
+
+## MVP 只需下载的数据
+
+### HotpotQA：第一阶段主数据集
+
+官方页面：[HotpotQA](https://hotpotqa.github.io/)
+
+只下载两个文件：
+
+| 文件 | 用途 | 下载地址 |
+|---|---|---|
+| `hotpot_train_v1.1.json` | 从中抽 200 条做阈值校准 | [下载](http://curtis.ml.cmu.edu/datasets/hotpot/hotpot_train_v1.1.json) |
+| `hotpot_dev_distractor_v1.json` | 从中抽 300 条做 MVP 主测试 | [下载](http://curtis.ml.cmu.edu/datasets/hotpot/hotpot_dev_distractor_v1.json) |
+
+不要下载：
+
+- `hotpot_dev_fullwiki_v1.json`；
+- `hotpot_test_fullwiki_v1.json`；
+- 完整 Wikipedia 语料；
+- BeerQA 或其他扩展语料。
+
+Ubuntu 下载：
+
+```bash
+mkdir -p data/raw/hotpotqa
+cd data/raw/hotpotqa
+
+wget -c -O train.json \
+  http://curtis.ml.cmu.edu/datasets/hotpot/hotpot_train_v1.1.json
+
+wget -c -O dev_distractor.json \
+  http://curtis.ml.cmu.edu/datasets/hotpot/hotpot_dev_distractor_v1.json
+```
+
+官方评测脚本：
+
+- [hotpot_evaluate_v1.py](https://raw.githubusercontent.com/hotpotqa/hotpot/master/hotpot_evaluate_v1.py)
+
+### 2WikiMultiHopQA：第二阶段外部验证
+
+不要一开始下载。等 HotpotQA 的 A0/A1/A2、路由和日志都跑通后，再下载。
+
+- 官方仓库：[Alab-NII/2wikimultihop](https://github.com/Alab-NII/2wikimultihop)
+- 官方数据包：[data.zip](https://www.dropbox.com/s/npidmtadreo6df2/data.zip?dl=1)
+- 官方评测脚本：[2wikimultihop_evaluate.py](https://github.com/Alab-NII/2wikimultihop/blob/main/2wikimultihop_evaluate.py)
+
+只需从解压后的数据中使用 `dev.json`，随机抽取 200 条。初期不需要：
+
+- `para_with_hyperlink.zip`；
+- 完整外部 Wikipedia 段落库；
+- 测试集；
+- 额外实体 ID 版本数据。
+
+## HotpotQA 的具体处理方式
+
+每条原始样本包含：
+
+```json
+{
+  "_id": "...",
+  "question": "...",
+  "answer": "...",
+  "supporting_facts": [["标题A", 1], ["标题B", 0]],
+  "context": [
+    ["标题A", ["句子0", "句子1", "..."]],
+    ["标题B", ["句子0", "句子1", "..."]]
+  ]
+}
+```
+
+预处理时，每个标题对应的一组句子先作为一个 passage，不要在 MVP 阶段过度切块：
+
+```json
+{
+  "qid": "原始_id",
+  "passage_id": "原始_id::标题A",
+  "title": "标题A",
+  "sentence_ids": [0, 1, 2],
+  "text": "标题A。句子0 句子1 句子2",
+  "is_gold_document": true,
+  "gold_supporting_sentence_ids": [1]
+}
+```
+
+其中：
+
+```text
+is_gold_document =
+标题是否出现在 supporting_facts 中
+```
+
+处理后，每个问题保存：
+
+```json
+{
+  "qid": "...",
+  "question": "...",
+  "gold_answer": "...",
+  "gold_supporting_facts": [["标题A", 1], ["标题B", 0]],
+  "candidate_passages": [...]
+}
+```
+
+然后执行：
+
+```text
+每题 10 个候选 passage
+  -> 本地 embedding 对问题和 10 个 passage 编码
+  -> dense 排序
+  -> reranker 重排全部 10 个 passage
+  -> 保存 Top-6 passage、分数和排名
+```
+
+由于每题只有少量候选文档，建议直接缓存为：
+
+```text
+cache/retrieval/hotpot_train_calibration.jsonl
+cache/retrieval/hotpot_dev_mvp.jsonl
+```
+
+每一行至少包含：
+
+```json
+{
+  "qid": "...",
+  "question": "...",
+  "reranked_passages": [...],
+  "rerank_scores": [...],
+  "top1_top2_margin": 0.0,
+  "gold_doc_recall_at_4": 1,
+  "gold_doc_recall_at_6": 1
+}
+```
+
+## 推荐的最小数据划分
+
+| 文件 | 抽样量 | 用途 |
+|---|---:|---|
+| `train.json` | 200 | 设定 R/E/D 阈值，不用于最终结果 |
+| `dev_distractor.json` | 20 | Prompt、JSON、检索和日志冒烟测试 |
+| `dev_distractor.json` | 300 | MVP 主测试集 |
+| 2Wiki `dev.json` | 200 | 通过后再做外部验证 |
+
+抽样必须固定种子并保存 ID，例如：
+
+```text
+seed = 42
+```
+
+不要根据“模型答得好不好”人工挑题，也不要在 300 条主测试集上调路由阈值。
+
+## 与 UltraRAG 的实际边界
+
+建议先完成这个最小验证：
+
+```text
+20 条 HotpotQA
+  -> UltraRAG 生成并检索候选 passage
+  -> 返回 passage_id、title、text、rerank_score
+  -> 你的 Qwen API 完成 A0
+  -> 保存原始请求、模型响应、token、延迟
+```
+
+只有当这 20 条满足以下条件后，才继续：
+
+- 检索结果可追溯到原始 `passage_id`；
+- reranker 输出稳定；
+- Qwen JSON 解析成功率接近 100%；
+- 支持文档 Recall@4 可正常计算；
+- 单题日志可完整复现。
+
+若 UltraRAG 的索引或配置妨碍你精确控制候选文档和 metadata，就保留它作为工程参考，MVP 检索部分改用直接的本地 BGE + reranker。对论文而言，可控性和可复现性比使用某个框架更重要。够用。**一张空闲的 RTX 3090 24GB 足以完成第一阶段 MVP**，包括 Qwen2.5-7B 推理、本地 embedding、reranker 和少量 NLI/语义相似度计算。
+
+但不要长期让 Qwen 服务、embedding 模型和 reranker 同时占用显存。更稳妥的方式是：
+
+1. 先离线完成语料切分、embedding、检索和 rerank，并缓存结果；
+2. 再启动 Qwen 服务运行 Agent；
+3. NLI/一致性计算优先放 CPU，或分批在 GPU 上运行后缓存。
+
+你现在的接口形式看起来是 OpenAI 兼容接口。建议先请求 `/v1/models` 确认实际 `model` 名称，并验证它能否稳定返回 JSON。Python 调用形态可统一为：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8000/v1",
+    api_key="local"
+)
+
+response = client.chat.completions.create(
+    model="你的实际模型名",
+    messages=[...],
+    temperature=0,
+    max_tokens=256,
+)
+```
+
+Qwen2.5-7B 足以验证系统机制和完成初步消融。后续论文正式实验建议再用一个稳定的国内强 API 在小规模测试集上复验，证明结论不只依赖某一个本地模型。
+
+## MVP 的目标
+
+验证下面这条主张是否成立：
+
+> 结合检索质量、证据支持度和 Agent 间答案分歧的规则路由，能否把简单问题留给单 Agent，把不确定问题升级给验证或多 Agent 流程，从而获得更好的质量-成本折中。
+
+第一阶段不要做完整 Contextual Bandit，也不要做复杂证据图中心性算法。先得到可信的路由和评测结果。
+
+## 1. 数据与实验规模
+
+建议先用英文多跳问答，避免中文数据和人工标注带来的额外变量。
+
+| 用途 | 数据 |
+|---|---|
+| 主数据集 | HotpotQA distractor setting |
+| 外部验证 | 2WikiMultiHopQA |
+| 路由阈值校准 | HotpotQA train 中随机固定 200 条 |
+| MVP 主测试 | HotpotQA dev 中随机固定 300 条 |
+| 外部验证测试 | 2WikiMultiHopQA dev 中随机固定 200 条 |
+
+固定随机种子，例如 `42`，保存问题 ID 列表。不要在主测试集上调阈值。
+
+第一阶段建议使用 HotpotQA 提供的每题候选文档作为检索语料。这是“候选文档 RAG”，不是完整开放域 Wikipedia 检索。论文中必须如实表述。这样可以先验证 Agent 路由，不会在构建全球 Wikipedia 索引上花掉数周。
+
+## 2. 本地检索与 Reranker
+
+### 文档结构
+
+把每条候选文档保存为：
+
+```json
+{
+  "qid": "问题编号",
+  "passage_id": "title_sent_0_3",
+  "title": "文档标题",
+  "sentence_ids": [0, 1, 2, 3],
+  "text": "正文片段"
+}
+```
+
+每个 passage 建议控制在约 80–160 英文 token，保留标题和原始句子编号。这样后续可计算支持证据召回和引用质量。
+
+### 模型与流程
+
+按照推荐或者使用本地的模型：
+
+- embedding：`BAAI/bge-m3` 或同等级本地多语 embedding；
+- reranker：`BAAI/bge-reranker-v2-m3`；
+- 向量索引：MVP 直接用 CPU FAISS `IndexFlatIP` 即可。
+
+对于 HotpotQA 的每题候选文档：
+
+```text
+问题
+  -> dense embedding 排序全部候选 passage
+  -> reranker 重排前 10 个
+  -> 取 Top-6 作为证据池
+  -> 单 Agent 默认看到 Top-4
+  -> 验证/多 Agent 可看到 Top-6
+```
+
+如果未来切换到完整语料库，则改为：
+
+```text
+全语料 dense Top-30
+  -> reranker Top-10
+  -> 给 Agent Top-6
+```
+
+### 需要缓存的内容
+
+每个问题保存：
+
+```json
+{
+  "qid": "...",
+  "dense_ranked_passages": [...],
+  "reranked_passages": [...],
+  "rerank_scores": [...],
+  "retrieval_metrics": {...}
+}
+```
+
+这一步预计算完成后，Qwen Agent 实验不再重复检索和 rerank。
+
+### 检索评估
+
+至少报告：
+
+- Supporting Document Recall@4、Recall@6；
+- Supporting Sentence Recall@6；
+- Dense retrieval 与 Dense + Reranker 的对比；
+- Top-1 与 Top-2 rerank 分数间隔分布。
+
+如果 reranker 没有稳定提高支持文档召回，不应继续把它作为系统核心组件。
+
+## 3. 三种动作
+
+三种动作应是同一问题上的不同“推理深度”，不是三个完全不同的系统。
+
+### A0：单 Agent RAG
+
+输入：
+
+- 问题；
+- Top-4 passage；
+- passage ID、标题和文本。
+
+输出严格 JSON：
+
+```json
+{
+  "answer": "...",
+  "claims": [
+    {
+      "claim": "...",
+      "evidence_ids": ["p_01", "p_04"]
+    }
+  ],
+  "abstain": false
+}
+```
+
+提示词约束：
+
+- 只能依据提供的 passage 回答；
+- 找不到支持证据时必须标记 `abstain=true`；
+- 不要求输出长篇推理过程；
+- 每条声明必须带证据 ID。
+
+配置建议：
+
+```text
+temperature = 0
+max_tokens = 160-220
+top passages = 4
+```
+
+A0 的成本为 1 次模型调用。
+
+### A1：验证 Agent
+
+A1 复用 A0 的草稿，并增加一个独立验证调用。
+
+验证 Agent 输入：
+
+- 问题；
+- A0 的答案和 claims；
+- Top-6 passage；
+- 原引用 ID。
+
+验证 Agent 输出：
+
+```json
+{
+  "claim_checks": [
+    {
+      "claim": "...",
+      "status": "supported | contradicted | insufficient",
+      "evidence_ids": ["p_03"]
+    }
+  ],
+  "revised_answer": "...",
+  "final_status": "answer | abstain"
+}
+```
+
+关键规则：
+
+- 验证 Agent 不能因为草稿“看起来合理”就接受；
+- 遇到证据不足或冲突，优先修正或拒答；
+- 验证 Agent 使用不同的 system prompt，避免与 A0 同质化。
+
+A1 总成本为 2 次调用：草稿 Agent + 验证 Agent。
+
+### A2：多 Agent 协作
+
+第一阶段不要设计五六个角色。建议保留四个顺序角色：
+
+```text
+1. Draft Agent：生成初步答案
+2. Verifier Agent：检查支持、冲突与遗漏
+3. Evidence Organizer：重组可用证据，指出每一跳是否完整
+4. Synthesizer：仅根据已确认的证据生成最终答案
+```
+
+其中前两个步骤直接复用 A0 和 A1 的结果，所以 A2 只额外调用：
+
+- Evidence Organizer；
+- Synthesizer。
+
+Evidence Organizer 输出：
+
+```json
+{
+  "subclaims": [
+    {
+      "claim": "...",
+      "supporting_evidence": ["p_01"],
+      "conflicting_evidence": [],
+      "status": "supported | missing | conflicted"
+    }
+  ],
+  "recommended_answer": "..."
+}
+```
+
+Synthesizer 只接收：
+
+- 问题；
+- 已核验的 claims；
+- 支持/冲突证据；
+- Organizer 的结构化输出。
+
+不要让 Synthesizer 再自由浏览全部无筛选文档，否则会削弱验证过程的意义。
+
+A2 总成本为 4 次调用。
+
+## 4. 三类置信度信号
+
+第一阶段不建议直接声称提出“新置信度指标”。先将它们定义为三类可比较的路由信号。
+
+### R：检索置信度
+
+从 reranker 输出得到，特征包括：
+
+- Top-1 rerank 分数；
+- Top-1 与 Top-2 的分数间隔；
+- Top-3 分数均值；
+- Top-k 分数方差；
+- passage 标题的覆盖多样性；
+- Top-k 软最大分布的熵。
+
+不要只使用单个 reranker 分数。先将这些特征归一化，再形成 `R_conf`。
+
+### E：证据支持置信度
+
+从 A0 输出的 claims 和引用中计算。
+
+推荐使用一个本地 NLI 模型，或轻量自然语言蕴含模型，在每个：
+
+```text
+claim <-> cited passage
+```
+
+上输出：
+
+```text
+P(entailment), P(neutral), P(contradiction)
+```
+
+定义：
+
+```text
+E_conf =
+平均支持概率
+× 有引用的 claim 比例
+× (1 - 冲突惩罚)
+```
+
+其中，出现 `contradiction` 或无证据 claim 时应显著降低 `E_conf`。
+
+这比直接拿 reranker 分数当“答案可信度”更合理，因为它检查的是答案声明与证据之间的关系。
+
+### D：Agent 间分歧度
+
+由 A0 与 Verifier 的结果计算。
+
+推荐从以下三个层面判断：
+
+- 标准化后的最终答案是否一致；
+- 两个答案的语义相似度；
+- 是否存在“一个支持、一个拒绝”或“互相矛盾”的判定。
+
+可以定义：
+
+```text
+D_conf = 语义一致性 - 矛盾惩罚
+```
+
+其中语义一致性可由本地 embedding cosine similarity 或本地 NLI 双向蕴含概率计算。
+
+第一阶段不必计算完整语义熵。完整语义熵通常需要 3–5 次随机采样，会增加大量调用。把它留作后续消融：
+
+```text
+R
+R + E
+R + E + D
+R + E + D + Semantic Entropy
+```
+
+## 5. 规则路由
+
+建议采用逐级升级的静态规则，而不是在 MVP 直接上 Bandit。
+
+```text
+先执行 A0
+  ↓
+计算 R_conf 和 E_conf
+  ↓
+若 R_conf 高且 E_conf 高：
+    接受 A0
+否则：
+    执行 A1
+  ↓
+计算验证后的 E_conf 和 D_conf
+  ↓
+若验证后证据充分、两者一致且无冲突：
+    接受 A1
+否则：
+    执行 A2
+```
+
+伪代码：
+
+```python
+draft = run_a0(question, top4)
+r_conf = retrieval_confidence(retrieval_cache)
+e0_conf = evidence_confidence(draft, passages)
+
+if r_conf >= tau_r and e0_conf >= tau_e:
+    return draft, "A0"
+
+verification = run_a1(question, draft, top6)
+e1_conf = evidence_confidence(verification, passages)
+d_conf = agreement_confidence(draft, verification)
+
+if e1_conf >= tau_v and d_conf >= tau_d and not has_conflict(verification):
+    return verification, "A1"
+
+return run_a2(question, draft, verification, top6), "A2"
+```
+
+阈值 `tau_r`、`tau_e`、`tau_v`、`tau_d` 只能在 HotpotQA 的校准集上通过网格搜索确定。
+
+优化目标可设为：
+
+```text
+最大化：Answer F1 - λ × Normalized Cost
+```
+
+同时保留多个 `λ`，画出质量-成本曲线，而不是只挑一个阈值报告。
+
+## 6. 必须对比的基线
+
+至少运行五组：
+
+| 系统 | 含义 |
+|---|---|
+| Fixed-A0 | 所有问题只跑单 Agent |
+| Fixed-A1 | 所有问题跑草稿 + 验证 |
+| Fixed-A2 | 所有问题跑完整多 Agent |
+| Rule-Router | R + E + D 驱动的逐级路由 |
+| Oracle Router | 事后知道正确答案时，选择最低成本且正确的动作，仅作理论上界 |
+
+还应做路由消融：
+
+```text
+R only
+R + E
+R + E + D
+```
+
+这能回答：性能提升究竟来自多 Agent，还是来自更可靠的路由信号。
+
+## 7. 评测指标
+
+### 准确率与证据质量
+
+HotpotQA：
+
+- Exact Match；
+- Answer F1；
+- Supporting Fact F1；
+- Supporting Document Recall@4、Recall@6；
+- 引用覆盖率；
+- 无支持答案比例；
+- 拒答的精确率和召回率。
+
+### 成本
+
+即使使用本地 Qwen，也要报告成本代理指标：
+
+- 平均模型调用次数；
+- 输入 token、输出 token；
+- 平均端到端延迟；
+- P50、P95 延迟；
+- 重试次数和 JSON 解析失败率；
+- 每题 GPU 推理时间。
+
+未来替换为 API 时，按对应供应商当期输入/输出 token 单价计算人民币成本。不要把本地推理成本直接写成零，而应保留 token 和 GPU 时间，保证不同部署方式可比较。
+
+### 校准与路由有效性
+
+将“答案是否正确”视为二元标签，报告：
+
+- AUROC：置信度区分正确/错误答案的能力；
+- AUPRC：错误样本较少时更有价值；
+- Brier Score；
+- Expected Calibration Error；
+- Risk-Coverage Curve；
+- AURC；
+- 质量-成本 Pareto 曲线。
+
+对最终 Answer F1 和平均成本差异使用 paired bootstrap，至少报告置信区间，而不是只报一个平均值。
+
+## 8. 4 周 MVP 排期
+
+| 周期 | 工作与交付物 |
+|---|---|
+| 第 1 小时 | 下载数据、切分 passage、本地 embedding/rerank、缓存 retrieval 结果、检索指标 |
+| 第 2 小时 | A0/A1/A2 Prompt、JSON 校验、日志、HotpotQA 20 条冒烟测试 |
+| 第 3 小时 | R/E/D 信号、本地 NLI、规则路由、校准集阈值搜索 |
+| 第 4 小时 | 300 条主实验、2Wiki 200 条外部验证、消融、质量-成本图和失败案例 |
+
+## 9. MVP 的止损条件
+
+出现以下情况时，不要立即扩展到 Bandit 或复杂证据图：
+
+- Reranker 未提高支持文档召回；
+- A1/A2 相比 A0 没有稳定质量提升；
+- `R + E + D` 对错误识别的 AUROC 接近随机；
+- 多 Agent 的质量提升只能通过大幅增加调用次数获得；
+- Qwen2.5-7B 的 JSON 失败率、引用幻觉率过高，导致证据评测不可用。
+
+MVP 成功的最低标准不是“多 Agent 准确率最高”，而是：
+
+> 路由系统在接近 Fixed-A1 或 Fixed-A2 的质量下，明显降低平均调用次数、token 消耗或延迟；或者在接近 Fixed-A0 成本下，取得更高的答案与证据质量。先整理一下当前真实状态，再向你汇报。我并行确认：数据文件、检索缓存、依赖与模型落地情况。
+现在状态清楚了。检索缓存里**缺少 `hotpot_dev_main_retrieval.jsonl`**（主测试 300 题还没跑完/没跑），而 `smoke` 和 `train_calibration` 已有结果。我之前启动了 `retrieval.py` 但可能被中断。确认一下主测试检索是否完成，以及已有缓存的指标。
+
+让我读取已生成的 metrics 和 smoke 缓存样本，确认任务3实际进度。
+`metrics.json` 为空/不存在——说明 `retrieval.py` 还没跑完（脚本末尾才写 metrics），说明主测试 300 题的检索尚未完成（进程中断）。smoke 和 train_calibration 的缓存已生成（说明脚本跑到一半被中断）。
+
+现在我向你完整汇报当前进度，然后继续把任务3跑完。
+
+---
+
+## 当前进度整理
+
+### 已完成的工作
+
+**任务1 — Qwen 服务验证（完成）**
+- `/v1/models` 端点返回 404（服务未实现），模型回显名固定为 `qwen-local`，所有 Agent 调用统一用此名。
+- JSON 稳定性：模拟 A0 严格 JSON 契约，`temperature=0` 连测 5 次 **100% 可解析**，答案正确，延迟平均 1.3s。结论：通过。
+
+**任务2 — 数据准备（完成，按 `database.md` 调整）**
+- 数据源：因官方 `curtis.ml.cmu.edu` 与 HF mirror JSON 直链均超时，**改用 HF mirror 的 HotpotQA parquet**（`hf_hub_download` 成功下载，id 与官方一致，字段等价）。
+- 已生成 3 个结构化数据集（按标题分组 passage + gold 标注）：
+  - `hotpot_dev_smoke.jsonl` — 20 题（冒烟）
+  - `hotpot_train_calibration.jsonl` — 200 题（校准集）
+  - `hotpot_dev_main.jsonl` — 300 题（主测试）
+- 每题含 10 个候选文档，标注 `is_gold_document` / `gold_supporting_sentence_ids`。
+- 2WikiMultiHopQA 暂未下载（HF mirror 该仓库 404，符合"第二阶段再做"）。
+
+**任务3 — 检索缓存（进行中，差主测试 300 题）**
+- 工具就绪：bi-encoder 用本地 `all-MiniLM-L6-v2`（CPU），rerank 用本地 `bge-m3` 的 `colbert+sparse+dense` 官方融合分数（CPU）。
+- 已生成缓存：`hotpot_dev_smoke_retrieval.jsonl`、`hotpot_train_calibration_retrieval.jsonl`（各取 Top-6，结构正确，gold 文档能进 Top-6）。
+- **缺失**：`hotpot_dev_main_retrieval.jsonl`（主测试 300 题未跑完）+ `metrics.json`（脚本跑完后才写）。
+
+### 下载的有用资产
+| 资产 | 路径 | 用途 |
+|---|---|---|
+| HotpotQA parquet (3个) | `~/.cache/huggingface/.../distractor/` | 数据来源 |
+| bge-m3 | `/nas_data/LLM/BAAI/bge-m3` | rerank |
+| all-MiniLM-L6-v2 | `/nas_data/LLM/sentence-transformers/all-MiniLM-L6-v2(384)` | embedding |
+| 已装依赖 | `.conda_qwen` 环境 | datasets, faiss, sentence-transformers, FlagEmbedding, huggingface_hub, modelscope 等 |
+
+### 环境注意点
+- `.conda_qwen` 的 torch 从 2.4.1 **升级到 2.13.0**（因旧版拒绝加载 `.bin` 权重）；该环境 CUDA 不可用，embedding/rerank 全在 **CPU** 运行（已验证可用）。**不影响** Qwen 服务独立环境。
+
+---
+
+现在把主测试 300 题的检索补全（后台跑），然后写 metrics。
+命令被取消了（exit 2）。不过进程 PID 2927376 可能还在后台跑（nohup）。但日志显示 bge-m3 在 CPU 上**每题约 3-7 秒**——主测试 300 题需 ~15-20 分钟，加上校准 200 题（之前已跑完缓存但进程重跑会覆盖）。
+
+关键点：脚本对 3 个 split 顺序跑，主测试在最后。若进程被中断，主测试缓存仍缺失。bge-m3 CPU 太慢（每题 3-7s 是因为它把 rerank 按 query 逐条 batch=10 但仍慢）。
+
