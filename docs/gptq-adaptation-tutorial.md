@@ -622,7 +622,9 @@ $PY tests/profile_spec.py 5
 
 **⑥ 投机解码怎么接进 continuous batching**（对应 bullet 6）
 - **一轮的形状**：γ 次 draft decode → 1 次 target verify（query 是 γ+1 个位置）→ 拒绝采样 → 回滚未被接受的部分。产出 `n_accepted + 1` 个 token（被拒时用 `(p−q)₊` 重采样的修正 token，全接受时白送一个 bonus token）。
-- **draft 要跑 γ+1 次而不是 γ 次**：第 γ+1 次的输出被丢弃，作用只是把第 `L+γ−1` 个位置的 K/V 补进 draft cache —— 下一轮若 bonus 也被接受，draft 的首个 query 正好落在那个位置，缺了它就会读到脏显存。
+- **draft 要跑 γ+1 次而不是 γ 次**：draft 自回归产出 `d_1…d_γ` 共 γ 个候选需 γ 次 forward，每步还会把「当前输入 token 的 K/V」写进 draft paged cache；第 γ 次 forward 只把 `d_{γ-1}` 的 K/V 落在位置 `L+γ-2`，位置 `L+γ-1`（即 `d_γ` 的）还没写。要让下一轮在「全接受 + bonus」后首个 query（`x_{L+γ}`，即 bonus token）能 attend 到完整前缀，draft cache 必须已持有 `d_γ` 在 `L+γ−1` 的 K/V —— 这要靠第 γ+1 次 forward（输入 `d_γ`）来写。因此第 γ+1 次的 **logits（预测的 `d_{γ+1}`）被丢弃不用**（verify 只覆盖 γ 个候选位置，没有第 γ+1 个要验），唯一价值是把 `d_γ` 的 K/V 落进 draft cache；少了这一步，下一轮全接受时会读到脏显存。
+- **拒绝采样的具体策略（逐位置、保分布）**：target 对 verify 的 γ+1 个 query 算出分布 `p_0…p_γ`，draft 已产出 `q_0…q_{γ−1}` 与候选 `d_1…d_γ`。从 `i=0` 起逐位：抽 `r∼U(0,1)`，若 `r < p_i(d_{i+1}) / q_i(d_{i+1})` 则**接受** `d_{i+1}` 并继续下一位；否则**拒绝**，从修正分布 `(p_i − q_i)_+ / Z_i`（`Z_i` 为归一化常数）重采一个修正 token 输出并停止本轮。若 γ 个候选全部接受，再从最后一个 verify 位置的分布 `p_γ` 额外抽一个 **bonus token** 白送（输出 `γ+1` 个）。判据 `r < p/q` 保证最终输出序列的分布严格等于 target 分布（TVD 0.006，验证见 ⑨）。
+  - **本项目的 draft 接受率 α**：装上 flash-attn 后、γ=7 下 **`α = 0.741`**、平均确认长度 6.19 / 8（未装自研 kernel 的旧口径仅 0.48~0.56）；α 随候选位置后移而下降，这正是动态 γ 存在的理由（见 ⑩）。
 - **verify 的 query 起点是 `x_{L−1}` 而不是 `x_L`**：这样 `seqlen_k − seqlen_q = L−1` 恰好等于 cache 里的有效长度，可以直接复用 `flash_attn_with_kvcache` 的 paged 语义（cache_seqlens=L−1，本次 k/v 当作追加在 cache 之后的新 token；chunked prefill 续段用的是同一套「前缀在 cache、新增在 k/v」约定），代价只是 `slot(L−1)` 被重写一次（内容不变）。
 - **占位与回滚**：draft token 先占位（append + 分配 block）、verify 后再确认；未被接受的由 `trim` 连同跨出的 block 一起回收 —— 只回滚 token 不回收 block 的话，几个 step 就会把 KV cache 吃光。
 - **序列级异构接受长度**：同一个 batch 里 seq A 接受 3 个、seq B 接受 1 个是常态，verify 的 `position_ids` / `slot_mapping` / 回滚数量都按序列分别构造。
@@ -636,22 +638,24 @@ $PY tests/profile_spec.py 5
 - **Triton `cached_causal_attn_kernel` 退为兜底**：flash-attn 要求 batch 内**定长** seqlen，而 chunked-prefill 续段会变长；这部分仍用自研 Triton kernel（每个 program 负责一个 `(query 行, head)`，前缀按 `block_table` 从 paged cache 取 K/V、本次新增从 contiguous k/v 取，两段共用 online softmax，掩码「query i 看 key ≤ i + cached_len」）。它也用于**无 flash-attn 的环境**。
 - **flash-decoding 分段（`_decode_split_kernel` / `_decode_reduce_kernel`）**：现在只是**无 flash-attn 时的 decode fallback**；原本为解决 decode 单 query token 填不满 82 个 SM 而沿 key 切成 `N_SPLITS` 段并行再归约。
 - **一个硬约束**：draft 单步 forward 被 CUDA graph 捕获，期间任何 GPU→CPU 同步都会让 capture 失败，所以相关静态量（如分段数）只能由**静态形状**（batch / heads / SM 数）决定，不能读 `ctx_lens` 实际值。
+- **关键澄清：自研 Triton kernel 是兜底、不是加速（针对"变长 vs 并发"的误解）**：① 变长续段必须用它，是因为 `flash_attn_with_kvcache` 要求 batch 内**定长** seqlen（chunked-prefill 续段各序列长度不齐、`flash_attn_varlen_func` 传 `block_table` 直接 core dump，见 ⑦ 开头），这部分原生接口覆盖不到，只能走自研 kernel；② **自研 kernel 不提升并发**，反而数值质量更低——装 flash-attn 前 draft 接受率仅 0.48~0.56，装上后跳到 0.74~0.90，说明原生接口更准。把引擎基线 4 并发从 77.4 提到 111.6 的是**装上 flash-attn（在定长路径 decode/verify 用原生接口）**，不是自研 kernel；自研 kernel 只负责原生接口覆盖不到的「变长续段 / 无 flash-attn」场景。
 
 **⑧ draft 的 launch-bound 怎么定位、graph 怎么做**（对应 bullet 8）
-- **定位**：用 torch profiler 打 draft 的单步 forward —— GPU kernel 合计只有 2.7 ms，Self CPU 5.4 ms，墙钟却 20 ms；按 call 数估约 600 次 kernel launch，属纯 launch-bound。此时端到端加速比只有 **0.70×**（γ+1 次 draft 的开销把收益全吃掉了）。
-- **做法**：把 draft 单步 forward（含 lm_head）整体捕获成 CUDA graph，输入 `input_ids` / `positions` / `slot_mapping` / `context_lens` / `block_tables` 全部换成**静态 buffer**、每步 `copy_` 进去后 replay；按 batch size 缓存 graph，首次遇到该 bs 才捕获。捕获前先在 side stream 上 warmup 3 次。
+- **定位**：用 torch profiler 打 draft 的单步 forward —— GPU kernel 合计只有 **2.7 ms**（所有 matmul/attention/layernorm 的 GPU 执行时间加总，即 GPU 真正干活的时间），Self CPU 5.4 ms、**墙钟（真实流逝时间，`time.time()` 前后一减）却 20 ms**；墙钟与 GPU 时间的差（~17 ms）就是 CPU 侧把约 600 次 kernel 逐个 **launch（核启动）** 的开销（每次启动几十微秒驱动调用），GPU 大部分时间在空等下一条指令——这种「非算力不够、非带宽不够、是发指令太慢」就叫纯 **launch-bound**（核启动受限）。此时端到端加速比只有 **0.70×**（γ+1 次 draft 的 launch 开销把收益全吃掉了）。
+- **做法**：把 draft 单步 forward（含 lm_head）整体捕获成 **CUDA graph**——把「这 ~600 次 launch 的命令序列」录制一次成图，之后不再让 CPU 逐个发，而是 **replay 整张图一次调用**（launch 开销被一次性吃掉）。图里记死了每个输入的显存地址，故 replay 前要把输入 `input_ids` / `positions` / `slot_mapping` / `context_lens` / `block_tables` 放进**静态 buffer**、每步 `copy_` 进去再 replay；形状由 **batch size** 决定，所以**每个 batch size 各捕获一张图并缓存**，首次遇到该 bs 才捕获（先在 side stream 上 warmup 3 次），之后全 replay。
 - **结果**：单步 **20.7 → 2.77 ms**，端到端 0.70× → **3.96×**。
 
 **⑨ 投机解码的正确性怎么证明**（对应 bullet 9）
-- **三层，不靠"看着像"**：① greedy 下输出必须等于「逐步 argmax」的黄金结果（含每个位置被拒时的修正）；② 采样模式下输出分布必须严格等于 target 分布；③ 端到端与「不开投机」的同引擎输出逐 token 相同（4 条 prompt 全一致）。
+- **三层，不靠"看着像"**：① **greedy（temperature=0、每步取 argmax，完全确定性、不随机）**下输出必须等于「逐步 argmax」的黄金结果（含每个位置被拒时的修正）；② 采样模式下输出**分布**必须严格等于 target 分布（用 TVD 度量，见下）；③ 端到端与「不开投机」的同引擎输出**逐 token 相同**——即两个序列在**每一个位置**的 token 都一致（单位：本表 `4/4` 的 4 = **测试 prompt 条数**，指 4 条 prompt 全部对齐；注意 GPTQ 那边的 `64/64` 单位是 **token**（2 prompt × 32 token），两者口径不同，别混）。
+- **TVD（Total Variation Distance，总变差距离）**：两分布距离 `0.5·Σ|P(x) − Q(x)|` ∈ [0,1]，0 表示分布完全相同。本项目采样首 token 分布与 target 的 TVD 仅 **0.006**，即投机解码基本不改变输出分布——这正是拒绝采样保证的。
 - **变异测试**：注入 4 种实现错误，检验必须逐个抓住 —— 漏除 q（TVD 0.383）、残差分布用 p（0.223）、残差分布用 draft 的 q（0.502）、bonus 取错位置（0.525）；正确实现的 TVD 是 0.006 / 0.011。其中「bonus 取错位置」只看首 token 分布**完全抓不到**（0.0053），必须两个指标都有 —— 这正是变异测试的价值。
-- **词表不等长**：0.5B 声明 151936、7B 声明 152064（多出 128 个 padding 条目）。先用脚本证明两边 tokenizer 在公共 id 区间上逐条一致（151665 词条、0 冲突），再把概率空间截断到公共前缀重归一化；被丢弃的尾部概率质量 7.8e-9，可忽略。反过来也保证 draft 输出的 id 必然 < 公共长度，绝不会让 target 的 embedding 越界。
+- **词表不等长**：0.5B 声明 151936、7B 声明 152064（target 多 128 个 padding 条目）。先用脚本证明两边 tokenizer 在公共 id 区间上**逐条一致、0 冲突**，其中**151665 个真实词条的字符串一一对应**（id 后面的差异主要是 special/padding 条目，所以准确说法是「公共区间内 0 冲突、151665 真实词条对齐」，而不是「前 151936 个 id 逐字相同」）；再把概率空间**截断到较小 vocab `V = min(151936, 152064) = 151936`** 重归一化，被丢弃的尾部概率质量 7.8e-9（target 几乎从不在那 128 个 padding id 上分配概率），可忽略。反过来也保证 draft 输出的 id 必然 < V，绝不会让 target 的 embedding 越界。
 
 **⑩ 动态 γ 怎么做的（对应 bullet 10）**
 - **为什么不用固定 γ**：接受率 α 随候选位置下降（越往后越难接受），且 draft/target 的相对快慢 c 取决于硬件与模型。固定 γ 只在一个工作点最优 —— 本配置 γ=7 单请求最高（3.96×），但并发在 γ=5~7 已饱和，且换 draft/硬件就得重调。
 - **选长度的公式**：一轮期望确认 token 数 `(1−α^(γ+1))/(1−α)`，成本约 `1 + γ·c`（`c` = 在线测得的 draft/target 单步耗时比，本配置 ≈0.07）。`γ* = argmax (1−α^(γ+1))/((1−α)(1+γ·c))` 即在「多确认 vs 多花钱」之间求最优。
-- **两个必须做对的细节（否则选歪）**：① 计时只测**纯 GPU 时间** —— draft 循环里每步 `tolist()` 都会同步，把 CPU 时间算进去会让 c 高估 2~3 倍、γ 被压小（实测单请求 decode 从 100 掉到 74）；② 用**实测的 γ→接受长度表**而不是恒定 α 的几何模型 —— 接受率随位置下降，几何模型会高估长链、把 γ 从 7 推到 8 反而变慢。再加 **10% 切换滞后**抑制 γ 在相邻值间抖动。
-- **结果**：4 并发 289.3 → 294.0（+1.6%）。真正价值是**换 draft/硬件免调参** —— c 从 0.07 升到 0.3 时最优 γ 会自动从 7 降到 2，不用人工改配置。
+- **两个必须做对的细节（否则选歪）**：① 计时只测**纯 GPU 时间** —— draft 循环里每步 `tolist()` 都会同步，把 CPU 时间算进去会让 c 高估 2~3 倍、γ 被压小（实测单请求 decode 从 100 掉到 74）；② 用**实测的 γ→接受长度表**而不是恒定 α 的几何模型 —— 接受率随候选位置下降，几何模型会高估长链、把 γ 从 7 推到 8 反而变慢；这张表是**跨所有 prompt 跑出来的工作负载级平均**（`EMA(每轮确认 token 数)`），自然 tolerate 单条 prompt 内容波动，不是按某条「具体问题」统计的，所以和 prompt 内容本身无关。再加 **10% 切换滞后**抑制 γ 在相邻值间抖动。
+- **结果**：4 并发 289.3 → 294.0（+1.6%）。真正价值是**换 draft/硬件免调参**：公式里的 `c = t_draft_step / t_target_step`（本配置 ≈0.07，即一次 draft 仅 target 的 7%）会随部署变化——换更大的 draft 模型、或 draft 没做 CUDA graph、或换到不同 GPU，c 都会上升；c 从 0.07 升到 0.3 时最优 γ 会自动从 7 降到 2，不用人工改配置。
 
 **⑪ EAGLE draft head（draft 方案的升级，可选扩展）**
 - **思路**：普通 draft-model 只用 token 分布逼近 target，接受率受 0.5B↔7B 能力差上限约束（装 flash-attn 后 α 0.74~0.90）。EAGLE 让 draft head（1 层 transformer，~259M）直接吃 **target 的隐藏状态**，并显式监督它预测 target 在下一位置的隐藏状态 —— 这样 head 不只猜 token 分布，还学到了"target 此时的内部表征长什么样"，而下一 token 几乎完全由这个表征决定，所以理论上接受率可显著高于独立 draft 模型（文献 7B 上 α 常到 0.8~0.9+）。
