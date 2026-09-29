@@ -580,7 +580,7 @@ $PY tests/profile_spec.py 5
 - **自研 Triton fused dequant-GEMM（默认路径）**：把反量化融进 GEMM kernel —— 打包的 int4 `qweight`/`qzeros` 在 kernel 内按 `group_size` 解包、算 `(w − z) · s` 后**直接喂 `tl.dot`**，全程不把 fp16 权重写回 HBM（int4 常驻显存、fp16 零物化）；因 cuBLAS 仅有 INT8、无 int4 非对称 per-group dequant-GEMM，这是**唯一能同时拿到省显存 + TensorCore 速度**的写法。
 - **双 kernel 精度分级 + 性能结果**：decode / 短 prefill 走 fp32 精确累加核 `ordered_gptq_linear` 保数值，长 prefill 走 `tl.dot` 核 `fused_gptq_linear`（已验证与 cuBLAS 逐位一致）；反量化路径吞吐 **8.5 → 77.4 tok/s（9.1×）**，权重显存锁定 5.2 GiB。
 - **针对 decode 自适应 GEMM 分块（occupancy 分析定位）**：按序列长度 M 自适应选 BM/BN/BK——用 occupancy 分析（CTA 数 = ⌈M/BM⌉×⌈N/BN⌉ 对比 82 SM）定位到 decode 小 M 时固定分块填不满 SM（旧 32×64 在 q_proj 仅 56 CTA < 82 SM、约 1/3 空转），据此改小分块提高 CTA 占用、长 prefill 用 128×128 吃满算力。
-- **新增 draft-target 投机解码并接入 continuous batching**：用量化腾出的显存装入 0.5B draft，新增「γ 次 draft decode + 1 次 target verify + 拒绝采样」轮次，支持序列级异构接受长度与 token 占位/回滚；单请求 decode 30.1 → 118.9 tok/s（3.96×）、4 并发 113.6 → 222.8 tok/s（1.96×）。
+- **在已有 continuous batching 循环中接入 draft-target 投机解码（非单序列教科书实现）**：用量化腾出的显存装入 0.5B draft，新增「γ 次 draft decode + 1 次 target verify + 拒绝采样」轮次，支持序列级异构接受长度与 token 占位/回滚；单请求 decode 30.1 → 118.9 tok/s（3.96×）、4 并发 113.6 → 222.8 tok/s（1.96×）。
 - **分页 KV attention 走 flash-attn 原生接口（Triton 兜底变长）**：decode / verify 直接由 `flash_attn_with_kvcache` 按 `block_table` 读 paged cache、不物化连续内存，变长续段 / 无 flash-attn 时退化自研 Triton kernel；顺带把引擎基线 4 并发从 77.4 提到 111.6 tok/s。
 - **draft 单步 forward 的 CUDA Graph 化**：profiler 定位到 draft 单步是 launch-bound（GPU 只算 2.7 ms、墙钟 20 ms），按 batch size 捕获并缓存 graph 后单步 20.7 → 2.77 ms，端到端加速比 0.70× → 3.96×。
 - **投机解码正确性验证（强证据 + 词表不等长）**：greedy 下与「不开投机」的同引擎输出逐 token 相同（4/4），采样用拒绝采样保证分布不变（TVD 0.006），注入 4 种实现错误逐个能抓住；draft/target 词表不等长（151936 vs 152064）截断到公共前缀重归一化。
