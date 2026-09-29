@@ -6,7 +6,7 @@ from nanovllm.models.eagle import EAGLEHead
 from transformers import AutoTokenizer
 
 MODEL = "/nas_data/WR/models/Qwen2.5-7B-Instruct-GPTQ-Int4"
-HEAD = "/tmp/eagle_v2.pt"
+HEAD = "/tmp/eagle_v3.pt"
 PROMPT = "请介绍一下你自己。"
 
 mr = ModelRunner(Config(MODEL, max_model_len=1024, gpu_memory_utilization=0.05), 0, [])
@@ -45,3 +45,13 @@ print("target top5:", [(tok.decode([i]), round(float(tgt_logits[0, i]), 1)) for 
 # 看 head 预测的隐藏状态与 target 隐藏状态差距 (应该很小才说明 head 学对了)
 print("||h_head - H_last|| / ||H_last|| =",
       float((h[0] - H_last).norm() / H_last.norm()))
+
+# ---- 诊断: head 是否真用了 target_hidden? 对比真实 hidden vs 零 hidden ----
+head.reset_chain(1, 1)
+with torch.inference_mode():
+    lg_zero, _ = head.forward_one(
+        torch.tensor([ids[-1]], dtype=torch.int64, device="cuda"),
+        torch.zeros_like(H_last).unsqueeze(0).half())
+print("head argmax (真实hidden):", tok.decode([lg[0].argmax(-1).item()]))
+print("head argmax (零hidden)  :", tok.decode([lg_zero[0].argmax(-1).item()]))
+print("两 hidden 下 logits 差异 norm:", float((lg - lg_zero).norm()))

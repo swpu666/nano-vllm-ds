@@ -160,7 +160,12 @@ def main():
             step += 1
             if step % 20 == 0:
                 print(f"step {step:5d}  loss={loss.item():.3f} "
-                      f"(tok={loss_tok.item():.3f} hid={loss_hid.item():.4f})")
+                      f"(tok={loss_tok.item():.3f} hid={loss_hid.item():.4f})", flush=True)
+            if step % 1000 == 0:
+                head.eval()
+                head.save_head(f"{args.out}.step{step}")
+                head.train()
+                print(f"[ckpt] saved {args.out}.step{step}", flush=True)
 
     head.eval()
     head.save_head(args.out)

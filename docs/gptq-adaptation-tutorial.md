@@ -580,11 +580,11 @@ $PY tests/profile_spec.py 5
 - **自研 Triton fused dequant-GEMM（默认路径）**：把反量化融进 GEMM kernel —— 打包的 int4 `qweight`/`qzeros` 在 kernel 内按 `group_size` 解包、算 `(w − z) · s` 后**直接喂 `tl.dot`**，全程不把 fp16 权重写回 HBM（int4 常驻显存、fp16 零物化）；因 cuBLAS 仅有 INT8、无 int4 非对称 per-group dequant-GEMM，这是**唯一能同时拿到省显存 + TensorCore 速度**的写法。
 - **双 kernel 精度分级 + 性能结果**：decode / 短 prefill 走 fp32 精确累加核 `ordered_gptq_linear` 保数值，长 prefill 走 `tl.dot` 核 `fused_gptq_linear`（已验证与 cuBLAS 逐位一致）；反量化路径吞吐 **8.5 → 77.4 tok/s（9.1×）**，权重显存锁定 5.2 GiB。
 - **针对 decode 自适应 GEMM 分块（occupancy 分析定位）**：按序列长度 M 自适应选 BM/BN/BK——用 occupancy 分析（CTA 数 = ⌈M/BM⌉×⌈N/BN⌉ 对比 82 SM）定位到 decode 小 M 时固定分块填不满 SM（旧 32×64 在 q_proj 仅 56 CTA < 82 SM、约 1/3 空转），据此改小分块提高 CTA 占用、长 prefill 用 128×128 吃满算力。
-- **新增 draft-target 投机解码模块，接入 continuous batching**：在引擎里新增「γ 次 draft decode + 1 次 target verify + 拒绝采样」轮次，支持序列级异构接受长度与 draft token 占位/回滚；draft 走未量化分支（`models/qwen2_dense.py`），target/draft 各持 paged KV cache 并按 block 字节比切分显存预算（draft 占 21%）。
-- **分页 KV attention 接入 flash-attn 原生接口（Triton 兜底变长）**：decode / verify 直接走 flash-attn `flash_attn_with_kvcache`（K/V 按 `block_table` 取、不物化连续内存），变长续段 / 无 flash-attn 时退化自研 Triton `cached_causal_attn_kernel`；替换 sdpa fallback 后引擎基线 4 并发吞吐 77.4 → 111.6 tok/s。
-- **draft 单步 forward 的 CUDA Graph 化（profiler 定位 launch-bound）**：0.5B draft 一次 forward GPU 仅算 2.7 ms、墙钟 20 ms（约 600 次 kernel launch），γ+1 次 draft 的 launch 开销吃掉收益（未 graph 加速比仅 0.70×）；按 batch size 缓存 graph 固化后单步 20.7 → 2.77 ms，端到端 0.70× → 3.96×。
-- **投机解码的正确性验证（强证据 + 词表不等长处理）**：greedy 下与「不开投机」的同引擎输出逐 token 相同（4/4）；采样用拒绝采样保证分布不变（首 token TVD 0.006），注入 4 种实现错误验证逐个能抓住；词表不等长（151936 vs 152064）截断到公共前缀重归一化（尾部 7.8e-9）；草稿接受率 α 0.74~0.90（装 flash-attn 后，greedy 下平均每轮确认 6.19 token）。
-- **动态 γ（按延迟模型在线选 draft 长度）**：在线测 draft/target 单步耗时比 c（≈0.07），用 `γ* = argmax (1−α^(γ+1))/((1−α)(1+γ·c))` 选长度，并用实测接受长度表 + 10% 滞后抑制抖动；4 并发 289.3 → 294.0，换 draft/硬件免调参（c 0.07→0.3 时最优 γ 7→2）。
+- **新增 draft-target 投机解码并接入 continuous batching**：用量化腾出的显存装入 0.5B draft，新增「γ 次 draft decode + 1 次 target verify + 拒绝采样」轮次，支持序列级异构接受长度与 token 占位/回滚；单请求 decode 30.1 → 118.9 tok/s（3.96×）、4 并发 113.6 → 222.8 tok/s（1.96×）。
+- **分页 KV attention 走 flash-attn 原生接口（Triton 兜底变长）**：decode / verify 直接由 `flash_attn_with_kvcache` 按 `block_table` 读 paged cache、不物化连续内存，变长续段 / 无 flash-attn 时退化自研 Triton kernel；顺带把引擎基线 4 并发从 77.4 提到 111.6 tok/s。
+- **draft 单步 forward 的 CUDA Graph 化**：profiler 定位到 draft 单步是 launch-bound（GPU 只算 2.7 ms、墙钟 20 ms），按 batch size 捕获并缓存 graph 后单步 20.7 → 2.77 ms，端到端加速比 0.70× → 3.96×。
+- **投机解码正确性验证（强证据 + 词表不等长）**：greedy 下与「不开投机」的同引擎输出逐 token 相同（4/4），采样用拒绝采样保证分布不变（TVD 0.006），注入 4 种实现错误逐个能抓住；draft/target 词表不等长（151936 vs 152064）截断到公共前缀重归一化。
+- **动态 γ（在线按延迟模型选 draft 长度）**：按实测接受长度表与 draft/target 单步耗时比在线求最优 γ，并用 10% 滞后抑制抖动；4 并发 289.3 → 294.0，换 draft / 硬件免调参。
 
 ## 口头展开（面试追问时讲，不写进简历正文）
 
@@ -627,6 +627,7 @@ $PY tests/profile_spec.py 5
 - **占位与回滚**：draft token 先占位（append + 分配 block）、verify 后再确认；未被接受的由 `trim` 连同跨出的 block 一起回收 —— 只回滚 token 不回收 block 的话，几个 step 就会把 KV cache 吃光。
 - **序列级异构接受长度**：同一个 batch 里 seq A 接受 3 个、seq B 接受 1 个是常态，verify 的 `position_ids` / `slot_mapping` / 回滚数量都按序列分别构造。
 - **多 rank 一致性**：一次 `run_spec` 调用内部无法中途同步，所以各 rank 用「轮次 + 步数」派生的**确定性 seed** 采样，保证同一轮采出相同的 draft token。
+- **显存怎么分**：draft 走未量化分支（`models/qwen2_dense.py`），target / draft 各持一份 paged KV cache，按 block 字节比切分量化腾出的显存预算（draft 占 21%）。
 - **为什么选投机解码而不是 TP / PD 分离**：本机双卡 3090 **无 NVLink**（`nvidia-smi topo` 显示 PHB，走 PCIe），跨机只有以太网；TP 每层要 2 次 all-reduce、PD 分离要搬整段 KV（7B 约 0.11 MB/token，2k prompt ≈ 230 MB，1 Gbps 下 1.8 s ≫ prefill 本身 ~100 ms），都吃不到收益。投机解码通信量为零，是这套硬件上唯一能稳定拿正收益的方向。
 
 **⑦ 分页 KV attention：flash-attn 原生接口为主、Triton 兜底**（对应 bullet 7）
@@ -651,6 +652,12 @@ $PY tests/profile_spec.py 5
 - **选长度的公式**：一轮期望确认 token 数 `(1−α^(γ+1))/(1−α)`，成本约 `1 + γ·c`（`c` = 在线测得的 draft/target 单步耗时比，本配置 ≈0.07）。`γ* = argmax (1−α^(γ+1))/((1−α)(1+γ·c))` 即在「多确认 vs 多花钱」之间求最优。
 - **两个必须做对的细节（否则选歪）**：① 计时只测**纯 GPU 时间** —— draft 循环里每步 `tolist()` 都会同步，把 CPU 时间算进去会让 c 高估 2~3 倍、γ 被压小（实测单请求 decode 从 100 掉到 74）；② 用**实测的 γ→接受长度表**而不是恒定 α 的几何模型 —— 接受率随位置下降，几何模型会高估长链、把 γ 从 7 推到 8 反而变慢。再加 **10% 切换滞后**抑制 γ 在相邻值间抖动。
 - **结果**：4 并发 289.3 → 294.0（+1.6%）。真正价值是**换 draft/硬件免调参** —— c 从 0.07 升到 0.3 时最优 γ 会自动从 7 降到 2，不用人工改配置。
+
+**⑪ EAGLE draft head（draft 方案的升级，可选扩展）**
+- **思路**：普通 draft-model 只用 token 分布逼近 target，接受率受 0.5B↔7B 能力差上限约束（装 flash-attn 后 α 0.74~0.90）。EAGLE 让 draft head（1 层 transformer，~259M）直接吃 **target 的隐藏状态**，并显式监督它预测 target 在下一位置的隐藏状态 —— 这样 head 不只猜 token 分布，还学到了"target 此时的内部表征长什么样"，而下一 token 几乎完全由这个表征决定，所以理论上接受率可显著高于独立 draft 模型（文献 7B 上 α 常到 0.8~0.9+）。
+- **实现**：head 复用 target 的 embed / lm_head / final-norm（同一对象、冻结，不占额外词表参数），只训 `fc` 投影 + 1 个 transformer block；训练目标 = `CE(next token) + w·MSE(预测的下一位置隐藏状态)`；推理时自回归起草 γ 个候选 + 1 次 target verify，复用现有拒绝采样 / 占位 / 回滚框架（正确性不受 head 影响，greedy 下仍与基线逐 token 相同）。代码见 `nanovllm/models/eagle.py`、`train_eagle.py`、`nanovllm/engine/model_runner.py:_run_spec_eagle`。
+- **关键坑**：`model()` 返回的是 final-norm **之后**的 hidden，head 输出也必须再过一次**同款** final-norm 才能喂 `lm_head`；漏掉这步会让 logits 处于错误归一化空间，α 直接归零（实测过）。
+- **接受率的根因（重要）**：α 不取决于代码，而取决于**训练数据**。head 是 259M 参数，要学到 `H[t]→H[t+1]` 的通用映射，需要**与部署领域匹配**的大语料（EAGLE 文献用 ~1B token 级）。本仓库自带的 27k token 教程语料领域窄、量不足，head 会过拟合到语料里的 `**` 等高频 markdown 模式，在中文通用 prompt 上退化为"恒输出某 token"、α≈0 —— 此时 EAGLE 退化为每轮只确认 1 个 bonus token（等于没投机，还多花 head 算力）。**换领域匹配的大语料 + 数千~上万 step 才能拿到有意义的 α**；这是数据/算力问题，不是实现缺陷。
 
 ## 量化指标（放简历"成绩"栏）
 
