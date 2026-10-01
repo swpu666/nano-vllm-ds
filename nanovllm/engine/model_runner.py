@@ -380,6 +380,19 @@ class ModelRunner:
         return token_ids
 
     # ------------------------------------------------------------ 投机解码
+    # 一轮投机解码 (run_spec) 的端到端流程, 这里只负责"算", 显存回收在 LLMEngine._step_spec:
+    #   1. 调度层 (LLMEngine._step_spec) 先给每个 seq 尾部占位 γ*K 个 token 并分配 block,
+    #      这些占位值会在 draft 阶段被真实输出覆盖。
+    #   2. draft 阶段 prepare_draft_decode + _draft_forward_graph: 自回归跑 γ+1 步
+    #      (第 γ+1 步只写 KV 不取 token, 见 prepare_draft_decode), 产出候选 d_1..d_γ。
+    #      draft 走 CUDA graph 是为了吃掉 kernel launch 开销 (见 _draft_forward_graph)。
+    #   3. verify 阶段 prepare_spec_verify: 把 [x_{L-1}, d_1..d_γ] 拼成一条 varlen 序列,
+    #      走 prefill 路径让 target 一次性给出 γ+1 个位置的 logits (spec_verify=True 保
+    #      留全部位置, 见 embed_head.py)。
+    #   4. Speculator.verify 做拒绝采样, 返回每序列本轮确认的 token 列表。
+    #   5. LLMEngine 按返回值把未接受的部分 trim 回滚, 并回收跨出去的 block。
+    # 双 KV pool: target 与 draft 各持一份 paged KV (slot 布局相同, 由 _slot_of 统一计算),
+    # 因此 prefill 时两份 cache 都要写 (见 run 里的 _draft_forward 分支)。
     def _slot_of(self, seq: Sequence, token_idx: int) -> int:
         """第 token_idx 个 token 落在 paged KV cache 的哪个 slot。draft/target 共用。"""
         return seq.block_table[token_idx // self.block_size] * self.block_size + token_idx % self.block_size

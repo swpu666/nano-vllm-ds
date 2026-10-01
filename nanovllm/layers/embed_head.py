@@ -57,8 +57,17 @@ class ParallelLMHead(VocabParallelEmbedding):
     def forward(self, x: torch.Tensor):
         context = get_context()
         if context.is_prefill and not context.spec_verify:
+            # 普通 prefill: 只需要每个序列**最后一个**位置的 logits 来采样第一个生成 token,
+            # 提前把 x 截到 [cu_q[i+1]-1] 这 B 行, 省掉前面所有 prompt token 的 lm_head 矩阵乘。
             last_indices = context.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
+        # 投机解码的 verify 分支 (spec_verify=True): 此时走的是 prefill 路径(要读历史 KV),
+        # 但 query 是 [x_{L-1}, d_1, ..., d_γ] 共 γ+1 个位置 —— **每一个位置**都要算 logits:
+        #   - 前 γ 个位置的 logits 用来做拒绝采样判据 (p(d_i)/q(d_i))
+        #   - 第 γ+1 个位置的 logits 是 bonus token 的分布 (全接受时额外白送的那一个)
+        # 所以不能按 "只取最后一行" 截断, 必须保留全部行 -> 也就是不进上面的 if 分支。
+        # 这一行就是 model_runner.prepare_spec_verify 里 set_context(..., spec_verify=True)
+        # 在 kernel 之外真正生效的地方, 是 verify 能拿到完整 logits 的开关。
         # fp16 matmul (lm_head 输入经 norm 归一化, std 小); 权重为完整 fp16 占显存大, 不全量转 fp32
         logits = torch.nn.functional.linear(x.half(), self.weight)
         if self.tp_size > 1:

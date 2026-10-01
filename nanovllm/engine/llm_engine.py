@@ -54,6 +54,9 @@ class LLMEngine:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
+        # 投机解码只加速 **decode** 阶段: prefill 是一次性把整段 prompt 算完, 没有
+        # "多猜几个 token" 的冗余可压榨, 所以 prefill 一律走普通 run()。只有已 prefill
+        # 完、进入逐 token 生成 (is_prefill=False) 的序列才进 _step_spec。
         if not (self.spec_enabled and not is_prefill):
             num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
             token_ids = self.model_runner.call("run", seqs, is_prefill)
@@ -61,7 +64,11 @@ class LLMEngine:
             outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
             return outputs, num_tokens
 
-        # 投机解码: 一轮产出 1~γ+1 个 token / seq
+        # ── 投机解码分支 ──────────────────────────────────────────────
+        # 注意: 这里只是把**普通 continuous-batching 的 decode 步内部**替换成一个投机轮次,
+        # 并没有改动 continuous batching 的底座 (请求动态进出、prefill/decode 混批、抢占都照旧)。
+        # 普通 decode 步是"每 seq 严格 +1 token"的齐步走; 这一支每 seq 本轮确认 1~γ+1 个
+        # token (变长、且同 batch 内序列间异构), 详见 _step_spec 开头的 6 点差异说明。
         # num_tokens 沿用约定 —— decode 返回负值, generate() 据此算 decode 吞吐
         num_tokens = -self._step_spec(seqs)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
@@ -70,9 +77,24 @@ class LLMEngine:
     def _step_spec(self, seqs: list[Sequence]) -> int:
         """跑一轮投机解码, 返回本轮**实际确认**的 token 总数。
 
+        与普通 continuous-batching 的 decode 步相比, 这一步有 6 点本质不同
+        (continuous batching 的底座 —— 请求动态进出、prefill/decode 混批、抢占 —— 不变,
+        变的是 decode 步内部被替换成了一个投机轮次):
+
+          1. 推进量变长: 普通步每 seq 严格 +1; 这里每 seq 本轮确认 1~γ+1 个
+             (n_accepted + 1, 含被拒修正 token 或全接受时白送的 bonus), 且同 batch 内
+             序列间异构 (A 接受 3 个、B 接受 1 个是常态)。
+          2. 占位 + 回滚: 必须先超额占位 γ*K 个 token + block, verify 后再把未接受的
+             连同跨出的 block 一起 trim 回收; 只回滚 token 不回收 block 会吃光 KV cache。
+          3. 逐序列构造: position_ids / slot_mapping / 回滚数量都按序列分别构造, 不再对称。
+          4. max_tokens/EOS 收尾要用"本轮开始快照" (base_completion), 否则占位虚增会
+             导致死循环 (每轮确认 0 token -> 永不 finish)。
+          5. greedy 一致性约束: 同一 batch 内 greedy 必须一致, 否则降级普通 decode。
+          6. 多阶段原子计算: γ 次 draft + 1 次 verify + 拒绝采样, 中途不让其他请求插入。
+
         职责划分: ModelRunner 只算, 显存回收/block 管理全部在这里做 ——
-        draft token 是"先占位后确认"的, 一旦调整紫部分必须把占位连同跨出去的
-        block 一起还回去, 否则 KV cache 会被逐步吃光。
+        draft token 是"先占位后确认"的, 一旦回滚就必须把占位连同跨出的 block 一起
+        还回去, 否则 KV cache 会被逐步吃光。
         """
         # 动态 γ: current_gamma 由 ModelRunner 每轮按"接受率 + draft/target 耗时比"更新。
         # 注意只取 rank0(主进程) 的那一份 —— worker 不做采样统计, 它的估计值不可信,

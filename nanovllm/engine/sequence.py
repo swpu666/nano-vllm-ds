@@ -27,7 +27,10 @@ class Sequence:
         self.num_scheduled_tokens = 0
         self.is_prefill = True
         self.block_table = []
-        # 投机解码: 尾部已占用 KV slot 但尚未被 target 确认的 draft token 数
+        # 投机解码: 尾部已占用 KV slot 但尚未被 target 确认的 draft token 数。
+        # 仅作"本序列当前处于 spec 中间态"的标记: append_spec_tokens 置为占位个数,
+        # BlockManager.trim 回滚时归零。它本身不参与索引计算 (索引靠 len(seq)/token_ids),
+        # 只用于调度层/回收层快速判断序列是否正挂着未确认的草稿。
         self.num_spec_tokens = 0
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens

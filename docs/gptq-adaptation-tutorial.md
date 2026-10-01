@@ -620,16 +620,16 @@ $PY tests/profile_spec.py 5
 - 差距不在数值（已 64/64），而在 kernel 质量：Marlin 把 int4 repack 成 mma 友好布局、访存完全 coalesced；我们按逐元素 shift 解包，访存效率更低。其次才是调度栈（CUDA Graph / FlashAttention / paged KV cache）。
 - 最划算的下一步：让 **target 侧（GPTQ）也能用 CUDA Graph**。`fused` 路径 int4 常驻、无每步动态反量化 buffer，理论上可捕获 —— draft 侧已经证明这条路走得通（见 ⑧）。
 
-**⑥ 投机解码怎么接进 continuous batching**（对应 bullet 6）
-- **一轮的形状**：γ 次 draft decode → 1 次 target verify（query 是 γ+1 个位置）→ 拒绝采样 → 回滚未被接受的部分。产出 `n_accepted + 1` 个 token（被拒时用 `(p−q)₊` 重采样的修正 token，全接受时白送一个 bonus token）。
-- **draft 要跑 γ+1 次而不是 γ 次**：draft 自回归产出 `d_1…d_γ` 共 γ 个候选需 γ 次 forward，每步还会把「当前输入 token 的 K/V」写进 draft paged cache；第 γ 次 forward 只把 `d_{γ-1}` 的 K/V 落在位置 `L+γ-2`，位置 `L+γ-1`（即 `d_γ` 的）还没写。要让下一轮在「全接受 + bonus」后首个 query（`x_{L+γ}`，即 bonus token）能 attend 到完整前缀，draft cache 必须已持有 `d_γ` 在 `L+γ−1` 的 K/V —— 这要靠第 γ+1 次 forward（输入 `d_γ`）来写。因此第 γ+1 次的 **logits（预测的 `d_{γ+1}`）被丢弃不用**（verify 只覆盖 γ 个候选位置，没有第 γ+1 个要验），唯一价值是把 `d_γ` 的 K/V 落进 draft cache；少了这一步，下一轮全接受时会读到脏显存。
-- **拒绝采样的具体策略（逐位置、保分布）**：target 对 verify 的 γ+1 个 query 算出分布 `p_0…p_γ`，draft 已产出 `q_0…q_{γ−1}` 与候选 `d_1…d_γ`。从 `i=0` 起逐位：抽 `r∼U(0,1)`，若 `r < p_i(d_{i+1}) / q_i(d_{i+1})` 则**接受** `d_{i+1}` 并继续下一位；否则**拒绝**，从修正分布 `(p_i − q_i)_+ / Z_i`（`Z_i` 为归一化常数）重采一个修正 token 输出并停止本轮。若 γ 个候选全部接受，再从最后一个 verify 位置的分布 `p_γ` 额外抽一个 **bonus token** 白送（输出 `γ+1` 个）。判据 `r < p/q` 保证最终输出序列的分布严格等于 target 分布（TVD 0.006，验证见 ⑨）。
+**⑥ 投机解码怎么接进 continuous batching**（对应 bullet 6；代码：`nanovllm/engine/llm_engine.py` 的 `step`/`_step_spec`/`_step_spec_fallback` + `nanovllm/engine/model_runner.py` 的 `run_spec`/`prepare_draft_decode`/`prepare_spec_verify` + `nanovllm/engine/speculator.py` 的 `verify`）
+- **一轮的形状**：γ 次 draft decode → 1 次 target verify（query 是 γ+1 个位置）→ 拒绝采样 → 回滚未被接受的部分。产出 `n_accepted + 1` 个 token（被拒时用 `(p−q)₊` 重采样的修正 token，全接受时白送一个 bonus token）。（代码：`llm_engine.py:_step_spec` 三段式占位/verify/回滚；`model_runner.py:run_spec`；`speculator.py:verify`）
+- **draft 要跑 γ+1 次而不是 γ 次**：draft 自回归产出 `d_1…d_γ` 共 γ 个候选需 γ 次 forward，每步还会把「当前输入 token 的 K/V」写进 draft paged cache；第 γ 次 forward 只把 `d_{γ-1}` 的 K/V 落在位置 `L+γ-2`，位置 `L+γ-1`（即 `d_γ` 的）还没写。要让下一轮在「全接受 + bonus」后首个 query（`x_{L+γ}`，即 bonus token）能 attend 到完整前缀，draft cache 必须已持有 `d_γ` 在 `L+γ−1` 的 K/V —— 这要靠第 γ+1 次 forward（输入 `d_γ`）来写。因此第 γ+1 次的 **logits（预测的 `d_{γ+1}`）被丢弃不用**（verify 只覆盖 γ 个候选位置，没有第 γ+1 个要验），唯一价值是把 `d_γ` 的 K/V 落进 draft cache；少了这一步，下一轮全接受时会读到脏显存。（代码：`model_runner.py:prepare_draft_decode` 的 `i==G` 注释 + `run_spec` 中 `if i == G: break`，约 603 行）
+- **拒绝采样的具体策略（逐位置、保分布）**：target 对 verify 的 γ+1 个 query 算出分布 `p_0…p_γ`，draft 已产出 `q_0…q_{γ−1}` 与候选 `d_1…d_γ`。从 `i=0` 起逐位：抽 `r∼U(0,1)`，若 `r < p_i(d_{i+1}) / q_i(d_{i+1})` 则**接受** `d_{i+1}` 并继续下一位；否则**拒绝**，从修正分布 `(p_i − q_i)_+ / Z_i`（`Z_i` 为归一化常数）重采一个修正 token 输出并停止本轮。若 γ 个候选全部接受，再从最后一个 verify 位置的分布 `p_γ` 额外抽一个 **bonus token** 白送（输出 `γ+1` 个）。判据 `r < p/q` 保证最终输出序列的分布严格等于 target 分布（TVD 0.006，验证见 ⑨）。（代码：`speculator.py:verify` → `_verify_greedy` 约 179 行 / `_verify_sampling` 约 198 行；bonus 取自 `p_all[:, G, :]`）
   - **本项目的 draft 接受率 α**：装上 flash-attn 后、γ=7 下 **`α = 0.741`**、平均确认长度 6.19 / 8（未装自研 kernel 的旧口径仅 0.48~0.56）；α 随候选位置后移而下降，这正是动态 γ 存在的理由（见 ⑩）。
-- **verify 的 query 起点是 `x_{L−1}` 而不是 `x_L`**：这样 `seqlen_k − seqlen_q = L−1` 恰好等于 cache 里的有效长度，可以直接复用 `flash_attn_with_kvcache` 的 paged 语义（cache_seqlens=L−1，本次 k/v 当作追加在 cache 之后的新 token；chunked prefill 续段用的是同一套「前缀在 cache、新增在 k/v」约定），代价只是 `slot(L−1)` 被重写一次（内容不变）。
-- **占位与回滚**：draft token 先占位（append + 分配 block）、verify 后再确认；未被接受的由 `trim` 连同跨出的 block 一起回收 —— 只回滚 token 不回收 block 的话，几个 step 就会把 KV cache 吃光。
-- **序列级异构接受长度**：同一个 batch 里 seq A 接受 3 个、seq B 接受 1 个是常态，verify 的 `position_ids` / `slot_mapping` / 回滚数量都按序列分别构造。
-- **多 rank 一致性**：一次 `run_spec` 调用内部无法中途同步，所以各 rank 用「轮次 + 步数」派生的**确定性 seed** 采样，保证同一轮采出相同的 draft token。
-- **显存怎么分**：draft 走未量化分支（`models/qwen2_dense.py`），target / draft 各持一份 paged KV cache，按 block 字节比切分量化腾出的显存预算（draft 占 21%）。
+- **verify 的 query 起点是 `x_{L−1}` 而不是 `x_L`**：这样 `seqlen_k − seqlen_q = L−1` 恰好等于 cache 里的有效长度，可以直接复用 `flash_attn_with_kvcache` 的 paged 语义（cache_seqlens=L−1，本次 k/v 当作追加在 cache 之后的新 token；chunked prefill 续段用的是同一套「前缀在 cache、新增在 k/v」约定），代价只是 `slot(L−1)` 被重写一次（内容不变）。（代码：`model_runner.py:prepare_spec_verify`，约 519 行）
+- **占位与回滚**：draft token 先占位（append + 分配 block）、verify 后再确认；未被接受的由 `trim` 连同跨出的 block 一起回收 —— 只回滚 token 不回收 block 的话，几个 step 就会把 KV cache 吃光。（代码：`llm_engine.py:_step_spec` 占位段 `may_append_n` / 回滚段 `trim` + `nanovllm/engine/block_manager.py` 的 `may_append_n` / `trim`）
+- **序列级异构接受长度**：同一个 batch 里 seq A 接受 3 个、seq B 接受 1 个是常态，verify 的 `position_ids` / `slot_mapping` / 回滚数量都按序列分别构造。（代码：`model_runner.py:prepare_spec_verify` 按 (seq, chain) 拼 `cu_seqlens` + `llm_engine.py:_step_spec` 回滚段按 `result.n_accepted[i]` 逐序列 `trim`，约 114 行起）
+- **多 rank 一致性**：一次 `run_spec` 调用内部无法中途同步，所以各 rank 用「轮次 + 步数」派生的**确定性 seed** 采样，保证同一轮采出相同的 draft token。（代码：`model_runner.py:_make_generator`，约 466 行，seed 基数 `_SPEC_GEN_BASE`）
+- **显存怎么分**：draft 走未量化分支（`models/qwen2_dense.py`），target / draft 各持一份 paged KV cache，按 block 字节比切分量化腾出的显存预算（draft 占 21%）。（代码：`model_runner.py:allocate_kv_cache` 约 216 行，`draft_ratio` 扣预算；`__init__` 中 `draft_kv_cache` 单独分配）
 - **为什么选投机解码而不是 TP / PD 分离**：本机双卡 3090 **无 NVLink**（`nvidia-smi topo` 显示 PHB，走 PCIe），跨机只有以太网；TP 每层要 2 次 all-reduce、PD 分离要搬整段 KV（7B 约 0.11 MB/token，2k prompt ≈ 230 MB，1 Gbps 下 1.8 s ≫ prefill 本身 ~100 ms），都吃不到收益。投机解码通信量为零，是这套硬件上唯一能稳定拿正收益的方向。
 
 **⑦ 分页 KV attention：flash-attn 原生接口为主、Triton 兜底**（对应 bullet 7）
@@ -773,3 +773,6 @@ PyTorch、Triton、GPTQ、weight-only quantization、int4、group-wise dequant�
 | `tests/check_prefill_cache.py` | 不变式：读 paged cache 的路径 == 整段重算 |
 | `tests/profile_spec.py` | target decode / draft decode / verify 的耗时分解 |
 | `docs/spec-decoding.md` | 投机解码设计文档（流程、三个坑、实测） |
+| `nanovllm/models/eagle.py` | EAGLE draft head：吃 target 隐藏状态预测下一 token，复用 target 的 embed/lm_head/final-norm（推理入口 `model_runner.py:_run_spec_eagle`，见 ⑪ 章节） |
+| `train_eagle.py` | EAGLE head 训练脚本：损失 = `CE(next token) + w·MSE(预测下一位置隐藏状态)` |
+| `test_eagle.py` | EAGLE 端到端冒烟 + 与基线对照 |
